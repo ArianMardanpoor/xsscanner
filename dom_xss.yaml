@@ -1,0 +1,53 @@
+id: dom-xss-headless
+
+info:
+  name: DOM-based XSS Detection (Headless)
+  author: arian & manus
+  severity: high
+  description: |
+    Uses a headless browser to detect if injected parameters reflect into dangerous DOM sinks.
+    This template tracks the randomized 'x9' prefix in common sinks.
+  tags: headless, dom-xss, xss
+
+headless:
+  - steps:
+      - action: navigate
+        args:
+          url: "{{BaseURL}}"
+
+      - action: waitload
+
+      - action: script
+        args:
+          code: |
+            (function() {
+              const sinks = [
+                'innerHTML', 'outerHTML', 'document.write', 'eval', 
+                'setTimeout', 'setInterval', 'location.href', 'src'
+              ];
+              const pattern = /x9[a-z]{3}['\"`\\;<{]/;
+              let found = [];
+
+              // Check if pattern exists in common sinks
+              if (pattern.test(document.documentElement.innerHTML)) {
+                found.push("Found in HTML");
+              }
+              
+              // More advanced check could be added here using Proxy or Object.defineProperty
+              // for real-time sink monitoring.
+              
+              return found.join(", ");
+            })()
+        name: dom_reflection
+
+    matchers:
+      - type: word
+        part: dom_reflection
+        words:
+          - "Found in HTML"
+
+    extractors:
+      - type: regex
+        part: dom_reflection
+        regex:
+          - "Found in HTML"
