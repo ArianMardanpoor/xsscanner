@@ -4,6 +4,7 @@ import os
 import json
 import sys
 import time
+import shutil
 import argparse
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -73,12 +74,32 @@ def run_nice_passive(target_url):
     try:
         script_path = os.path.join(os.getcwd(), "nice_passive.py")
         subprocess.run(f"python3 {script_path} {domain}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        passive_file = f"{domain}.passive"
-        if os.path.exists(passive_file):
-            with open(passive_file, "r") as f: return f.read().splitlines()
-    except: pass
+        
+        original_passive_file = f"{domain}.passive"
+        
+        # تعریف مسیر دایرکتوری جدید برای فایل‌های passive
+        passive_output_dir = os.path.join(OUTPUT_DIR, "passive_results")
+        
+        # اگر دایرکتوری وجود نداشت، آن را بساز
+        if not os.path.exists(passive_output_dir):
+            os.makedirs(passive_output_dir)
+            
+        new_passive_file = os.path.join(passive_output_dir, original_passive_file)
+        
+        if os.path.exists(original_passive_file):
+            # خواندن محتوای فایل برای بازگرداندن در تابع
+            with open(original_passive_file, "r") as f: 
+                urls = f.read().splitlines()
+            
+            # انتقال فایل از دایرکتوری اصلی به دایرکتوری جداگانه
+            shutil.move(original_passive_file, new_passive_file)
+            
+            return urls
+    except Exception as e: 
+        log(f"Error handling passive file: {e}", "\033[31m")
+        pass
+        
     return []
-
 def run_nice_params(target_url):
     host = get_hostname(target_url)
     log(f"Running nice_params for {target_url}...")
