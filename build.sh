@@ -1,0 +1,8 @@
+#!/bin/bash
+go build -o nice_passive nice_passive.go
+go build -o nice_katana nice_katana.go
+go build -o nice_params nice_params.go
+go build -o x9 x9.go
+go build -o xssniper xssniper.go
+go build -o scanner main.go
+echo "Build complete."

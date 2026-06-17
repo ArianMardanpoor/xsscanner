@@ -14,8 +14,8 @@ import (
 
 // ANSI Colors
 const (
-	gray  = "\033[90m"
-	reset = "\033[0m"
+	P_gray  = "\033[90m"
+	P_reset = "\033[0m"
 )
 
 func getHostname(rawURL string) string {
@@ -57,7 +57,7 @@ func runCommand(name string, args ...string) (string, error) {
 }
 
 func runNicePassive(domain, outDir string) {
-	fmt.Printf("%sgathering URLs passively for: %s%s\n", gray, domain, reset)
+	fmt.Printf("%sgathering URLs passively for: %s%s\n", P_gray, domain, P_reset)
 
 	// Ensure output directory exists
 	if err := os.MkdirAll(outDir, 0755); err != nil {
@@ -78,7 +78,7 @@ func runNicePassive(domain, outDir string) {
 	tempFile.Close()
 
 	// 2. Waybackurls
-	fmt.Printf("%sExecuting waybackurls for %s%s\n", gray, domain, reset)
+	fmt.Printf("%sExecuting waybackurls for %s%s\n", P_gray, domain, P_reset)
 	cmd := exec.Command("sh", "-c", "echo $DOMAIN | waybackurls | sort -u | uro")
 	cmd.Env = append(os.Environ(), "DOMAIN="+domain)
 	wbOut, err := cmd.Output()
@@ -89,7 +89,7 @@ func runNicePassive(domain, outDir string) {
 	}
 
 	// 3. Gau
-	fmt.Printf("%sExecuting gau for %s%s\n", gray, domain, reset)
+	fmt.Printf("%sExecuting gau for %s%s\n", P_gray, domain, P_reset)
 	gauOut, err := runCommand("gau", domain, "--threads", "1", "--subs")
 	if err == nil {
 		f, _ := os.OpenFile(tempPath, os.O_APPEND|os.O_WRONLY, 0644)
@@ -97,7 +97,7 @@ func runNicePassive(domain, outDir string) {
 		f.Close()
 	}
 
-	fmt.Printf("%smerging results for: %s%s\n", gray, domain, reset)
+	fmt.Printf("%smerging results for: %s%s\n", P_gray, domain, P_reset)
 
 	// Finalize: unique and filter extensions
 	finalize(tempPath, domain, outDir)
@@ -121,7 +121,7 @@ func finalize(filePath, domain, outDir string) {
 	}
 
 	if len(uniqueLines) == 0 {
-		fmt.Printf("%snothing found for %s%s\n", gray, domain, reset)
+		fmt.Printf("%snothing found for %s%s\n", P_gray, domain, P_reset)
 		return
 	}
 
@@ -139,7 +139,7 @@ func finalize(filePath, domain, outDir string) {
 		count++
 	}
 
-	fmt.Printf("%sdone for %s, results: %d saved to %s%s\n", gray, domain, count, outputPath, reset)
+	fmt.Printf("%sdone for %s, results: %d saved to %s%s\n", P_gray, domain, count, outputPath, P_reset)
 }
 
 func main() {

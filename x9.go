@@ -10,12 +10,7 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"time"
 )
-
-// ============================================
-// آمار خروجی
-// ============================================
 
 type Stats struct {
 	TotalURLs  int
@@ -30,16 +25,14 @@ func newStats() *Stats {
 	}
 }
 
-// ============================================
-// ۱. لیست پیش‌فرض پارامترها و هدرها
-// ============================================
-
 var defaultParams = []string{
 	"q", "s", "search", "id", "lang", "keyword", "query", "page",
 	"keywords", "year", "view", "email", "type", "name", "p", "month",
 	"image", "list_type", "url", "terms", "categoryid", "key", "login",
 	"begindate", "enddate", "d", "redirect_uri", "currentURL", "callback",
 	"debug", "test", "redirect", "src", "source", "file", "path",
+	"next", "return", "return_url", "returnUrl", "continue", "to", "goto", "callback",
+	"checkout_url", "dest", "destination", "redir", "out", "view", "from_url",
 }
 
 var targetHeaders = []string{
@@ -49,11 +42,9 @@ var targetHeaders = []string{
 	"Origin",
 	"X-Real-IP",
 	"Client-IP",
+	"X-Forwarded-Host",
+	"X-Host",
 }
-
-// ============================================
-// ۲. تابع تولید رشته رندوم
-// ============================================
 
 func randomString(n int) string {
 	var letters = []rune("abcdefghijklmnopqrstuvwxyz")
@@ -63,10 +54,6 @@ func randomString(n int) string {
 	}
 	return string(s)
 }
-
-// ============================================
-// ۳. Payload های جدید (بر پایه Break)
-// ============================================
 
 func getBreakPayloads() []string {
 	prefix := "x9" + randomString(3)
@@ -81,10 +68,6 @@ func getBreakPayloads() []string {
 	}
 }
 
-// ============================================
-// ۴. ساختار URL تجزیه‌شده
-// ============================================
-
 type ParsedURL struct {
 	Scheme   string
 	Host     string
@@ -93,10 +76,6 @@ type ParsedURL struct {
 	Fragment string
 	Params   map[string]string
 }
-
-// ============================================
-// ۵. توابع کمکی
-// ============================================
 
 func parseURL(rawURL string) (*ParsedURL, error) {
 	u, err := url.Parse(rawURL)
@@ -112,7 +91,9 @@ func parseURL(rawURL string) (*ParsedURL, error) {
 		Params:   make(map[string]string),
 	}
 	for k, v := range u.Query() {
-		parsed.Params[k] = v[0]
+		if len(v) > 0 {
+			parsed.Params[k] = v[0]
+		}
 	}
 	return parsed, nil
 }
@@ -166,17 +147,13 @@ func getAllParams(originalParams map[string]string, paramFile string) []string {
 	return result
 }
 
-// ============================================
-// ۶. تولید خروجی‌های JSON و Header
-// ============================================
-
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	// No need for rand.Seed(time.Now().UnixNano()) in Go 1.20+
 
 	var (
 		inputFile  string
 		paramFile  string
-		outputFile string
+		outputBase string
 		singleURL  string
 		probeMode  bool
 		jsonMode   bool
@@ -186,7 +163,7 @@ func main() {
 	flag.StringVar(&inputFile, "i", "", "File containing URLs")
 	flag.StringVar(&singleURL, "u", "", "Single URL to test")
 	flag.StringVar(&paramFile, "p", "", "Custom parameters file")
-	flag.StringVar(&outputFile, "o", "x9_output.txt", "Output file")
+	flag.StringVar(&outputBase, "o", "x9_output", "Output base filename (suffixes will be added)")
 	flag.BoolVar(&probeMode, "probe", false, "Enable canary probe mode")
 	flag.BoolVar(&jsonMode, "json", false, "Enable JSON body generation")
 	flag.BoolVar(&headerMode, "headers", false, "Enable Header injection mode")
@@ -202,18 +179,30 @@ func main() {
 		rawURLs = append(rawURLs, singleURL)
 	}
 	if inputFile != "" {
-		file, _ := os.Open(inputFile)
-		sc := bufio.NewScanner(file)
-		for sc.Scan() {
-			if line := strings.TrimSpace(sc.Text()); line != "" {
-				rawURLs = append(rawURLs, line)
+		file, err := os.Open(inputFile)
+		if err == nil {
+			sc := bufio.NewScanner(file)
+			for sc.Scan() {
+				if line := strings.TrimSpace(sc.Text()); line != "" {
+					rawURLs = append(rawURLs, line)
+				}
 			}
+			file.Close()
 		}
-		file.Close()
 	}
 
-	f, _ := os.Create(outputFile)
-	defer f.Close()
+	fGet, _ := os.Create(outputBase + ".get")
+	defer fGet.Close()
+
+	var fJson, fHeader *os.File
+	if jsonMode {
+		fJson, _ = os.Create(outputBase + ".json")
+		defer fJson.Close()
+	}
+	if headerMode {
+		fHeader, _ = os.Create(outputBase + ".header")
+		defer fHeader.Close()
+	}
 
 	for _, raw := range rawURLs {
 		base, err := parseURL(raw)
@@ -221,9 +210,12 @@ func main() {
 			continue
 		}
 
-		payloads := getBreakPayloads()
+		var payloads []string
 		if probeMode {
+			// For probe, we use a single canary, but we will test it against each parameter individually if needed
 			payloads = []string{"x9canary" + randomString(3)}
+		} else {
+			payloads = getBreakPayloads()
 		}
 
 		allParams := getAllParams(base.Params, paramFile)
@@ -236,25 +228,23 @@ func main() {
 					newParams[k] = v
 				}
 				newParams[p] = payload
-				fmt.Fprintln(f, buildURL(base, newParams))
+				fmt.Fprintln(fGet, buildURL(base, newParams))
 			}
 
 			// 2. JSON Body Mode
-			if jsonMode {
+			if jsonMode && fJson != nil {
 				jsonData := make(map[string]string)
 				for _, p := range allParams {
 					jsonData[p] = payload
 				}
 				jsonStr, _ := json.Marshal(jsonData)
-				// Output format: URL|JSON_BODY
-				fmt.Fprintf(f, "%s://%s%s|%s\n", base.Scheme, base.Host, base.Path, string(jsonStr))
+				fmt.Fprintf(fJson, "%s://%s%s|%s\n", base.Scheme, base.Host, base.Path, string(jsonStr))
 			}
 
 			// 3. Header Injection Mode
-			if headerMode {
+			if headerMode && fHeader != nil {
 				for _, h := range targetHeaders {
-					// Output format: URL|HEADER_NAME:HEADER_VALUE
-					fmt.Fprintf(f, "%s|%s:%s\n", raw, h, payload)
+					fmt.Fprintf(fHeader, "%s|%s:%s\n", raw, h, payload)
 				}
 			}
 		}
