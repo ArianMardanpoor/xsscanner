@@ -21,14 +21,14 @@ import (
 // ─── ANSI Colors ───────────────────────────────────────────────────────────────
 
 const (
-	boldGreen  = "\033[1;32m"
-	boldYellow = "\033[1;33m"
-	boldRed    = "\033[1;31m"
-	boldBlue   = "\033[1;34m"
-	boldCyan   = "\033[1;36m"
-	boldWhite  = "\033[1;37m"
-	dimWhite   = "\033[2;37m"
-	reset      = "\033[0m"
+	PR_boldGreen  = "\033[1;32m"
+	PR_boldYellow = "\033[1;33m"
+	PR_boldRed    = "\033[1;31m"
+	PR_boldBlue   = "\033[1;34m"
+	PR_boldCyan   = "\033[1;36m"
+	PR_boldWhite  = "\033[1;37m"
+	PR_dimWhite   = "\033[2;37m"
+	PR_reset      = "\033[0m"
 )
 
 // ─── Regexes ───────────────────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ func printf(format string, args ...interface{}) {
 	printMu.Unlock()
 }
 
-func logError(msg string) {
+func logErrorMsg(msg string) {
 	logMu.Lock()
 	defer logMu.Unlock()
 	// In a real application, you might write to a log file here.
@@ -93,14 +93,14 @@ func logError(msg string) {
 	fmt.Fprintf(os.Stderr, "[ERROR] %s\n", msg)
 }
 
-func printInfo(msg string)    { printf("%s[*]%s %s\n", boldBlue, reset, msg) }
-func printSuccess(msg string) { printf("%s[+]%s %s\n", boldGreen, reset, msg) }
-func printWarning(msg string) { printf("%s[!]%s %s\n", boldYellow, reset, msg) }
-func printError(msg string)   { printf("%s[-]%s %s\n", boldRed, reset, msg) }
-func printStep(msg string)    { printf("%s[>]%s %s\n", boldBlue, reset, msg) }
+func printInfo(msg string)    { printf("%s[*]%s %s\n", PR_boldBlue, PR_reset, msg) }
+func printSuccess(msg string) { printf("%s[+]%s %s\n", PR_boldGreen, PR_reset, msg) }
+func printWarning(msg string) { printf("%s[!]%s %s\n", PR_boldYellow, PR_reset, msg) }
+func printError(msg string)   { printf("%s[-]%s %s\n", PR_boldRed, PR_reset, msg) }
+func printStep(msg string)    { printf("%s[>]%s %s\n", PR_boldBlue, PR_reset, msg) }
 
 func printSep() {
-	printf("%s%s%s\n", dimWhite, strings.Repeat("─", 50), reset)
+	printf("%s%s%s\n", PR_dimWhite, strings.Repeat("─", 50), PR_reset)
 }
 
 // ─── Output File Naming ────────────────────────────────────────────────────────
@@ -158,7 +158,7 @@ func writeHostParamFile(outFile string, newParams []string) (int, error) {
 	existing, err := readParams(outFile)
 	if err != nil && !os.IsNotExist(err) {
 		// Log error if file exists but cannot be read, but continue if file doesn't exist
-		logError(fmt.Sprintf("failed to read existing params from %s: %v", outFile, err))
+		logErrorMsg(fmt.Sprintf("failed to read existing params from %s: %v", outFile, err))
 	}
 
 	seen := make(map[string]bool, len(existing))
@@ -213,7 +213,7 @@ func runFallparams(ctx context.Context, rawURL string, silent bool) ([]string, e
 
 	runDir, err := os.MkdirTemp("", "fall_isolate_*")
 	if err != nil {
-		logError(fmt.Sprintf("failed to create temp directory for fallparams: %v", err))
+		logErrorMsg(fmt.Sprintf("failed to create temp directory for fallparams: %v", err))
 		return nil, fmt.Errorf("failed to create temp directory for fallparams: %v", err)
 	}
 	registerTemp(runDir)
@@ -227,7 +227,7 @@ func runFallparams(ctx context.Context, rawURL string, silent bool) ([]string, e
 		if !silent {
 			printWarning(msg)
 		} else {
-			logError(msg)
+			logErrorMsg(msg)
 		}
 		// Continue processing even if fallparams fails, it might still produce output
 	}
@@ -238,7 +238,7 @@ func runFallparams(ctx context.Context, rawURL string, silent bool) ([]string, e
 	if _, statErr := os.Stat(fallOutPath); statErr == nil {
 		readParamsResult, readParamsErr := readParams(fallOutPath)
 		if readParamsErr != nil {
-			logError(fmt.Sprintf("failed to read fallparams output file %s: %v", fallOutPath, readParamsErr))
+			logErrorMsg(fmt.Sprintf("failed to read fallparams output file %s: %v", fallOutPath, readParamsErr))
 		} else {
 			params = readParamsResult
 		}
@@ -321,7 +321,7 @@ func runX8(ctx context.Context, rawURL, wordlist string, silent bool) ([]string,
 		if !silent {
 			printWarning(msg)
 		} else {
-			logError(msg)
+			logErrorMsg(msg)
 		}
 		// Continue processing even if x8 fails, it might still produce output
 	}
@@ -382,7 +382,7 @@ func processURL(ctx context.Context, rawURL string, cfg *Config) Result {
 			if !cfg.Silent {
 				printError(fallErr.Error())
 			} else {
-				logError(fallErr.Error())
+				logErrorMsg(fallErr.Error())
 			}
 		} else {
 			add(params)
@@ -396,7 +396,7 @@ func processURL(ctx context.Context, rawURL string, cfg *Config) Result {
 			if !cfg.Silent {
 				printError(x8Err.Error())
 			} else {
-				logError(x8Err.Error())
+				logErrorMsg(x8Err.Error())
 			}
 		} else {
 			add(params)
@@ -480,13 +480,13 @@ func processURLFile(ctx context.Context, cfg *Config) error {
 		processed++
 		if !cfg.Silent {
 			printSep()
-			printf("%s[%d/%d]%s %s\n", boldWhite, processed, len(urls), reset, res.URL)
+			printf("%s[%d/%d]%s %s\n", PR_boldWhite, processed, len(urls), PR_reset, res.URL)
 		}
 		if res.Err != nil {
 			if !cfg.Silent {
 				printError(res.Err.Error())
 			} else {
-				logError(res.Err.Error())
+				logErrorMsg(res.Err.Error())
 			}
 			continue
 		}
@@ -537,15 +537,15 @@ func main() {
 	flag.BoolVar(&cfg.NoFall, "no-fall", false, "Skip fallparams (x8 only)")
 
 	flag.Usage = func() {
-		printf("%sUsage:%s\n", boldYellow, reset)
+		printf("%sUsage:%s\n", PR_boldYellow, PR_reset)
 		printf("  nice_params -u <URL>                        Single URL\n")
 		printf("  nice_params -f <file>                       Bulk URLs from file\n")
 		printf("  nice_params -u <URL> -w <wordlist>          Custom wordlist for x8\n")
 		printf("  nice_params -f urls.txt -d results/         Save host-param.txt files to custom dir\n")
 		printf("  nice_params -f urls.txt -t 10               10 concurrent workers\n\n")
-		printf("%sOutput:%s\n", boldYellow, reset)
+		printf("%sOutput:%s\n", PR_boldYellow, PR_reset)
 		printf("  Files are automatically named <HOST>-param.txt (e.g. asda.com-param.txt)\n\n")
-		printf("%sFlags:%s\n", boldYellow, reset)
+		printf("%sFlags:%s\n", PR_boldYellow, PR_reset)
 		flag.PrintDefaults()
 	}
 
@@ -587,7 +587,7 @@ func main() {
 	go func() {
 		<-sigCh
 		if !cfg.Silent {
-			printf("\n%s[!]%s Interrupted — cleaning up…\n", boldYellow, reset)
+			printf("\n%s[!]%s Interrupted — cleaning up…\n", PR_boldYellow, PR_reset)
 		}
 		cancel()
 	}()

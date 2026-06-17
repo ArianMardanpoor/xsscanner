@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,25 +18,25 @@ import (
 
 // ANSI Colors
 const (
-	gray   = "\033[90m"
-	reset  = "\033[0m"
-	purple = "\033[35m"
-	bold   = "\033[1m"
-	red    = "\033[31m"
-	green  = "\033[32m"
-	cyan   = "\033[36m"
+	M_gray   = "\033[90m"
+	M_reset  = "\033[0m"
+	M_purple = "\033[35m"
+	M_bold   = "\033[1m"
+	M_red    = "\033[31m"
+	M_green  = "\033[32m"
+	M_cyan   = "\033[36m"
 )
 
 var (
 	apiURL         = "http://localhost:3131/api/http"
 	apiToken       = os.Getenv("WATCHTOWER_API_TOKEN")
 	oldTargetsFile = "all_scanned_targets.txt"
-	outputDir      = "./results"
+	globalOutputDir = "./results"
 )
 
 func logMsg(msg string, color string) {
 	ts := time.Now().Format("15:04:05")
-	fmt.Printf("%s[%s]%s %s[BRIDGE] %s%s\n", gray, ts, reset, color, msg, reset)
+	fmt.Printf("%s[%s]%s %s[BRIDGE] %s%s\n", M_gray, ts, M_reset, color, msg, M_reset)
 }
 
 type APIResponse struct {
@@ -49,37 +48,37 @@ type APIResponse struct {
 }
 
 func fetchDataFromAPI(mode string) []string {
-	logMsg(fmt.Sprintf("Connecting to API in %s mode...", strings.ToUpper(mode)), cyan)
+	logMsg(fmt.Sprintf("Connecting to API in %s mode...", strings.ToUpper(mode)), M_cyan)
 	var allURLs []string
 	currentPage := 1
 	perPage := 500
 
 	for {
-		url := fmt.Sprintf("%s?page=%d&per_page=%d", apiURL, currentPage, perPage)
+		urlStr := fmt.Sprintf("%s?page=%d&per_page=%d", apiURL, currentPage, perPage)
 		if mode == "fresh" {
-			url += "&only_changed=true"
+			urlStr += "&only_changed=true"
 		}
 
-		req, _ := http.NewRequest("GET", url, nil)
+		req, _ := http.NewRequest("GET", urlStr, nil)
 		req.Header.Set("X-API-Token", apiToken)
 		req.Header.Set("Accept", "application/json")
 
 		client := &http.Client{Timeout: 60 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			logMsg(fmt.Sprintf("API Error: %v", err), red)
+			logMsg(fmt.Sprintf("API Error: %v", err), M_red)
 			break
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != 200 {
-			logMsg(fmt.Sprintf("API returned status: %d", resp.StatusCode), red)
+			logMsg(fmt.Sprintf("API returned status: %d", resp.StatusCode), M_red)
 			break
 		}
 
 		var apiResp APIResponse
 		if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-			logMsg(fmt.Sprintf("JSON Decode Error: %v", err), red)
+			logMsg(fmt.Sprintf("JSON Decode Error: %v", err), M_red)
 			break
 		}
 
@@ -99,12 +98,12 @@ func fetchDataFromAPI(mode string) []string {
 		currentPage++
 	}
 
-	logMsg(fmt.Sprintf("Total unique URLs retrieved from API: %d", len(allURLs)), cyan)
+	logMsg(fmt.Sprintf("Total unique URLs retrieved from API: %d", len(allURLs)), M_cyan)
 	return allURLs
 }
 
 func getNewTargetsOnly(targets []string) []string {
-	logMsg("Checking for new targets (Diffing)...", cyan)
+	logMsg("Checking for new targets (Diffing)...", M_cyan)
 	scanned := make(map[string]bool)
 	file, err := os.Open(oldTargetsFile)
 	if err == nil {
@@ -124,36 +123,49 @@ func getNewTargetsOnly(targets []string) []string {
 	return newTargets
 }
 
-func markAsScanned(url string) {
+func markAsScanned(urlStr string) {
 	f, err := os.OpenFile(oldTargetsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	f.WriteString(url + "\n")
-	logMsg(fmt.Sprintf("Target marked as scanned: %s", url), green)
+	f.WriteString(urlStr + "\n")
+	logMsg(fmt.Sprintf("Target marked as scanned: %s", urlStr), M_green)
 }
 
-func runTool(name string, args ...string) {
+func runBinary(name string, args ...string) {
 	cmd := exec.Command(name, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Run()
 }
 
+func getSafeName(u string) string {
+	return regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(u, "_")
+}
+
 func processTarget(target string, mode string) {
-	logMsg(fmt.Sprintf("--- Starting: %s ---", target), purple+bold)
+	logMsg(fmt.Sprintf("--- Starting: %s ---", target), M_purple+M_bold)
 
 	u, err := url.Parse(target)
 	if err != nil {
-		logMsg(fmt.Sprintf("Invalid URL: %s", target), red)
+		logMsg(fmt.Sprintf("Invalid URL: %s", target), M_red)
 		return
 	}
 	hostname := u.Hostname()
 	if hostname == "" {
 		hostname = target
 	}
-	safeURL := regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(target, "_")
+	safeURL := getSafeName(target)
+
+	// Results subdirectories
+	passiveDir := filepath.Join(globalOutputDir, "passive")
+	katanaDir := filepath.Join(globalOutputDir, "katana")
+	paramsDir := filepath.Join(globalOutputDir, "params")
+
+	os.MkdirAll(passiveDir, 0755)
+	os.MkdirAll(katanaDir, 0755)
+	os.MkdirAll(paramsDir, 0755)
 
 	// Step 1: Run Passive, Katana, and Params in parallel
 	var wg sync.WaitGroup
@@ -161,66 +173,60 @@ func processTarget(target string, mode string) {
 
 	go func() {
 		defer wg.Done()
-		logMsg(fmt.Sprintf("Running nice_passive for %s", target), gray)
-		runTool("go", "run", "nice_passive.go", hostname)
+		logMsg(fmt.Sprintf("Running nice_passive for %s", target), M_gray)
+		runBinary("./nice_passive", "-o", passiveDir, hostname)
 	}()
 
 	go func() {
 		defer wg.Done()
-		logMsg(fmt.Sprintf("Running nice_katana for %s", target), gray)
-		runTool("go", "run", "nice_katana.go", target)
+		logMsg(fmt.Sprintf("Running nice_katana for %s", target), M_gray)
+		runBinary("./nice_katana", "-o", katanaDir, target)
 	}()
 
 	go func() {
 		defer wg.Done()
-		logMsg(fmt.Sprintf("Running nice_params for %s", target), gray)
-		runTool("go", "run", "nice_params.go", "-u", target)
+		logMsg(fmt.Sprintf("Running nice_params for %s", target), M_gray)
+		runBinary("./nice_params", "-u", target, "-d", paramsDir)
 	}()
 
 	wg.Wait()
 
 	// Step 2: Aggregate results and run xssniper
-	logMsg(fmt.Sprintf("Launching XSSniper for %s", target), cyan)
+	logMsg(fmt.Sprintf("Launching XSSniper for %s", target), M_cyan)
 
-	jobFile := filepath.Join(outputDir, fmt.Sprintf("job_%s.txt", hostname+"_"+time.Now().Format("20060102150405")))
-	os.MkdirAll(outputDir, 0755)
+	jobFile := filepath.Join(globalOutputDir, fmt.Sprintf("job_%s.txt", safeURL+"_"+time.Now().Format("20060102150405")))
 
 	f, err := os.Create(jobFile)
 	if err == nil {
 		defer f.Close()
 		f.WriteString(target + "\n")
 
-		// 1. Passive results
-		passiveFile := filepath.Join("results", "passive", hostname+".passive")
-		if pFile, err := os.Open(passiveFile); err == nil {
-			io.Copy(f, pFile)
-			pFile.Close()
-			f.WriteString("\n")
+		// Helper to append file content carefully
+		appendSafe := func(path string) {
+			if pFile, err := os.Open(path); err == nil {
+				scanner := bufio.NewScanner(pFile)
+				for scanner.Scan() {
+					line := strings.TrimSpace(scanner.Text())
+					if line != "" {
+						f.WriteString(line + "\n")
+					}
+				}
+				pFile.Close()
+			}
 		}
 
-		// 2. Katana results
-		katanaFile := filepath.Join("results", "katana", safeURL+"-katana.txt")
-		if kFile, err := os.Open(katanaFile); err == nil {
-			io.Copy(f, kFile)
-			kFile.Close()
-			f.WriteString("\n")
-		}
-
-		// 3. Params results
-		paramFile := filepath.Join("results", "params", hostname+"-param.txt")
-		if prFile, err := os.Open(paramFile); err == nil {
-			io.Copy(f, prFile)
-			prFile.Close()
-			f.WriteString("\n")
-		}
+		appendSafe(filepath.Join(passiveDir, hostname+".passive"))
+		appendSafe(filepath.Join(katanaDir, safeURL+"-katana.txt"))
+		appendSafe(filepath.Join(paramsDir, hostname+"-param.txt"))
 	}
 
 	// Run xssniper
-	runTool("go", "run", "xssniper.go", "-l", jobFile, "-w", "3")
+	runBinary("./xssniper", "-l", jobFile, "-w", "3")
 
-	if mode == "normal" {
-		markAsScanned(target)
-	}
+	// Even in fresh mode we should probably mark as scanned if we want to avoid double scan in SAME run
+	// but the requirement said fresh mode scans everything.
+	// Let's mark as scanned to avoid rescanning in normal mode later.
+	markAsScanned(target)
 }
 
 func main() {
@@ -232,7 +238,7 @@ func main() {
 	if *inputFile != "" {
 		file, err := os.Open(*inputFile)
 		if err != nil {
-			logMsg(fmt.Sprintf("Error opening input file: %v", err), red)
+			logMsg(fmt.Sprintf("Error opening input file: %v", err), M_red)
 			return
 		}
 		scanner := bufio.NewScanner(file)
@@ -257,11 +263,11 @@ func main() {
 	}
 
 	if len(newTargets) == 0 {
-		logMsg("No targets to process.", green)
+		logMsg("No targets to process.", M_green)
 		return
 	}
 
-	logMsg(fmt.Sprintf("Ready to process %d targets in %s mode.", len(newTargets), strings.ToUpper(*mode)), cyan)
+	logMsg(fmt.Sprintf("Ready to process %d targets in %s mode.", len(newTargets), strings.ToUpper(*mode)), M_cyan)
 	for _, target := range newTargets {
 		processTarget(target, *mode)
 	}
