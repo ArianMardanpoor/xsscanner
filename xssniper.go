@@ -135,8 +135,8 @@ func stripANSI(str string) string {
 	return re.ReplaceAllString(str, "")
 }
 
-func runPhase(cmdStr string) (string, error) {
-	cmd := exec.Command("sh", "-c", cmdStr)
+func runCommand(name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
 	out, err := cmd.Output()
 	return string(out), err
 }
@@ -147,41 +147,16 @@ func processURL(targetURL string, index, total int) {
 	logLine("TARGET", white, "[%d/%d] %s", index, total, targetURL)
 	safe := regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(targetURL, "_")
 
-	// Phase 1: Katana Crawl (Live Discovery)
-	logLine("PHASE", yellow, "1/5 Crawling for deep discovery...")
-	katanaOutput := filepath.Join(outputDir, safe+"-katana.txt")
-	// Advanced Katana Logic (inspired by nice_katana)
-	// Using jsluice, automatic form fill, and heavy extension filtering
-	extFilter := "json,js,fnt,ogg,css,jpg,jpeg,png,svg,img,gif,exe,mp4,flv,pdf,doc,ogv,webm,wmv,webp,mov,mp3,m4a,m4p,ppt,pptx,scss,tif,tiff,ttf,otf,woff,woff2,bmp,ico,eot,htc,swf,rtf,image,rf,txt,ml,ip"
-	katanaCmd := fmt.Sprintf("katana -u %s -d 2 -js-crawl -jsluice -known-files all -automatic-form-fill -extension-filter %s -silent -o %s", targetURL, extFilter, katanaOutput)
-	runPhase(katanaCmd)
-
-	file, _ := os.Open(katanaOutput)
-	sc := bufio.NewScanner(file)
-	var targets []string
-	for sc.Scan() {
-		if u := strings.TrimSpace(sc.Text()); u != "" {
-			targets = append(targets, u)
-			mu.Lock()
-			allCrawledURLs = append(allCrawledURLs, u)
-			mu.Unlock()
-		}
-	}
-	file.Close()
-	if len(targets) == 0 {
-		targets = append(targets, targetURL)
-	}
-
 	// Phase 2: Canary Probe (Harmless Detection)
 	logLine("PHASE", cyan, "2/5 Canary Probing (GET, POST, JSON, Headers)...")
 	probeInput := filepath.Join(outputDir, safe+"-probe-in.txt")
-	os.WriteFile(probeInput, []byte(strings.Join(targets, "\n")), 0644)
+	os.WriteFile(probeInput, []byte(targetURL), 0644) // In this architecture, each processURL might be one URL from the job file
 	probeOutput := filepath.Join(outputDir, safe+"-probe-out.txt")
-	runPhase(fmt.Sprintf("go run x9_v2.go -probe -json -headers -i %s -o %s", probeInput, probeOutput))
+	runCommand("go", "run", "x9.go", "-probe", "-json", "-headers", "-i", probeInput, "-o", probeOutput)
 
 	// Phase 3: Filter Vulnerable Parameters
 	logLine("PHASE", blue, "3/5 Filtering reflective parameters...")
-	filterResults, _ := runPhase(fmt.Sprintf("nuclei -l %s -t %s -silent", probeOutput, canaryTemplate))
+	filterResults, _ := runCommand("nuclei", "-l", probeOutput, "-t", canaryTemplate, "-silent")
 	if filterResults == "" {
 		logLine("INFO", gray, "No reflective parameters found. Skipping heavy attacks.")
 		return
@@ -193,17 +168,17 @@ func processURL(targetURL string, index, total int) {
 	// Phase 4: Heavy Attack (Reflection & DOM)
 	logLine("PHASE", purple, "4/5 Executing Heavy Attacks & DOM Scan...")
 	finalX9 := filepath.Join(outputDir, safe+"-final.txt")
-	runPhase(fmt.Sprintf("go run x9_v2.go -i %s -json -headers -o %s -c %d", attackInput, finalX9, concurrency))
+	runCommand("go", "run", "x9.go", "-i", attackInput, "-json", "-headers", "-o", finalX9)
 
 	// Reflection Scan
-	if findings, _ := runPhase(fmt.Sprintf("nuclei -l %s -t %s -silent", finalX9, nucleiTemplate)); findings != "" {
+	if findings, _ := runCommand("nuclei", "-l", finalX9, "-t", nucleiTemplate, "-silent"); findings != "" {
 		lines := strings.Split(strings.TrimSpace(findings), "\n")
 		logLine("VULN", red, "Found %d Reflections!", len(lines))
 		tg.notify(targetURL, lines, "Reflection")
 	}
 
 	// DOM Scan (Headless)
-	if dom, _ := runPhase(fmt.Sprintf("nuclei -l %s -t %s -headless -silent", finalX9, domTemplate)); dom != "" {
+	if dom, _ := runCommand("nuclei", "-l", finalX9, "-t", domTemplate, "-headless", "-silent"); dom != "" {
 		lines := strings.Split(strings.TrimSpace(dom), "\n")
 		logLine("VULN", red, "Found %d DOM XSS!", len(lines))
 		tg.notify(targetURL, lines, "DOM")
@@ -266,8 +241,22 @@ func main() {
 	// Phase 5: Final Second-Order XSS Check
 	logLine("PHASE", white, "5/5 Final Second-Order Check on all discovered URLs...")
 	finalIn := filepath.Join(outputDir, "all_crawled_discovery.txt")
-	os.WriteFile(finalIn, []byte(strings.Join(allCrawledURLs, "\n")), 0644)
-	if so, _ := runPhase(fmt.Sprintf("nuclei -l %s -t %s -silent", finalIn, nucleiTemplate)); so != "" {
+
+	// Collect all URLs from input file
+	var allInURLs []string
+	if *urlFile != "" && *urlFile != "-" {
+		file, _ := os.Open(*urlFile)
+		sc := bufio.NewScanner(file)
+		for sc.Scan() {
+			if u := strings.TrimSpace(sc.Text()); u != "" {
+				allInURLs = append(allInURLs, u)
+			}
+		}
+		file.Close()
+	}
+
+	os.WriteFile(finalIn, []byte(strings.Join(allInURLs, "\n")), 0644)
+	if so, _ := runCommand("nuclei", "-l", finalIn, "-t", nucleiTemplate, "-silent"); so != "" {
 		lines := strings.Split(strings.TrimSpace(so), "\n")
 		logLine("VULN", red, "Found %d Second-Order XSS vulnerabilities!", len(lines))
 		tg.notify("Global Second-Order Check", lines, "Second-Order")
