@@ -63,22 +63,97 @@ func newTelegram() *Telegram {
 }
 
 func dedupeNucleiFindings(findings []string) []string {
-	// Group findings by: TemplateID + URL (without payload part)
-	// Example line: [x9-v2-reflection-matcher] [http] [info] http://localhost:2121/test.php?p=x9canaryabc [x9canaryabc]
-	// We want to keep only one finding per URL+Template if the payload is just a variation.
+	// Pattern to match x9 payloads, including URL encoded characters
+	reX9 := regexp.MustCompile(`x9(?:canary)?[a-z]{3}(?:['\"` + "`" + `\\;<{]|%[0-9a-fA-F]{2})*`)
+	rePayload := regexp.MustCompile(`\["([^"]+)"\]$`)
 
-	// For x9, we redact the randomized part: x9[a-z]{3}
-	reX9 := regexp.MustCompile(`x9(?:canary)?[a-z]{3}['\"` + "`" + `\\;<{]*`)
+	type Group struct {
+		BaseURL  string
+		Payloads []string
+		Seen     map[string]bool
+	}
 
-	seen := make(map[string]bool)
-	var unique []string
+	groups := make(map[string]*Group)
+	var order []string
 
 	for _, f := range findings {
-		// Redact the x9 payload to normalize the finding line
-		normalizedLine := reX9.ReplaceAllString(f, "x9REDACTED")
-		if !seen[normalizedLine] {
-			seen[normalizedLine] = true
-			unique = append(unique, f)
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+
+		// Extract payload
+		var currentPayload string
+		if m := rePayload.FindStringSubmatch(f); len(m) > 1 {
+			currentPayload = m[1]
+		}
+
+		// Grouping key: URL with redacted x9 payload
+		key := reX9.ReplaceAllString(f, "x9REDACTED")
+		key = rePayload.ReplaceAllString(key, "")
+		key = strings.TrimSpace(key)
+
+		if _, ok := groups[key]; !ok {
+			// Extract just the URL part
+			parts := strings.Fields(key)
+			urlPart := ""
+			for _, p := range parts {
+				if strings.HasPrefix(p, "http") {
+					urlPart = p
+					break
+				}
+			}
+			groups[key] = &Group{
+				BaseURL: urlPart,
+				Seen:    make(map[string]bool),
+			}
+			order = append(order, key)
+		}
+
+		if currentPayload != "" && !groups[key].Seen[currentPayload] {
+			groups[key].Seen[currentPayload] = true
+			groups[key].Payloads = append(groups[key].Payloads, currentPayload)
+		}
+	}
+
+	var result []string
+	for _, key := range order {
+		g := groups[key]
+		if g.BaseURL == "" {
+			continue
+		}
+
+		quoted := make([]string, len(g.Payloads))
+		for i, p := range g.Payloads {
+			quoted[i] = fmt.Sprintf("\"%s\"", p)
+		}
+		result = append(result, fmt.Sprintf("%s [%s]", g.BaseURL, strings.Join(quoted, ", ")))
+	}
+	return result
+}
+
+func dedupeConfirmedURLs(urls []string) []string {
+	seen := make(map[string]bool)
+	var unique []string
+	reX9 := regexp.MustCompile(`x9(?:canary)?[a-z]{3}(?:%[0-9a-fA-F]{2}|.)*`)
+	for _, u := range urls {
+		// Ensure we don't have duplicated parameters in the URL itself
+		parsed, err := url.Parse(u)
+		if err == nil {
+			query := parsed.Query()
+			for k, v := range query {
+				if len(v) > 1 {
+					query.Set(k, v[0])
+				}
+			}
+			parsed.RawQuery = query.Encode()
+			u = parsed.String()
+		}
+
+		normalized := reX9.ReplaceAllString(u, "x9REDACTED")
+		if !seen[normalized] {
+			seen[normalized] = true
+			unique = append(unique, u)
 		}
 	}
 	return unique
@@ -218,59 +293,74 @@ func processURL(targetURL string, index, total int) {
 	logLine("PHASE", X_blue, "3/5 Filtering reflective parameters...")
 	// We check GET, JSON, and Header probes
 	probeFiles := []string{probeOutputBase + ".get", probeOutputBase + ".json", probeOutputBase + ".header"}
-	var allFilterResults []string
+	var httpConfirmed []string
+	var domConfirmed []string
+
 	for _, pf := range probeFiles {
 		if _, err := os.Stat(pf); err == nil {
 			// HTTP Canary
 			res, _ := runCommand("nuclei", "-l", pf, "-t", canaryTemplate, "-silent")
 			if res != "" {
-				allFilterResults = append(allFilterResults, extractURLsFromNuclei(res)...)
+				httpConfirmed = append(httpConfirmed, extractURLsFromNuclei(res)...)
 			}
 
 			// DOM Canary (Only for GET/URLs)
 			if strings.HasSuffix(pf, ".get") {
 				resDom, _ := runCommand("nuclei", "-l", pf, "-t", "dom_canary.yaml", "-headless", "-silent")
 				if resDom != "" {
-					allFilterResults = append(allFilterResults, extractURLsFromNuclei(resDom)...)
+					domConfirmed = append(domConfirmed, extractURLsFromNuclei(resDom)...)
 				}
 			}
 		}
 	}
 
-	allFilterResults = uniqueStrings(allFilterResults)
+	httpConfirmed = dedupeConfirmedURLs(httpConfirmed)
+	domConfirmed = dedupeConfirmedURLs(domConfirmed)
 
-	if len(allFilterResults) == 0 {
+	if len(httpConfirmed) == 0 && len(domConfirmed) == 0 {
 		logLine("INFO", X_gray, "No reflective parameters found. Skipping heavy attacks.")
 		return
 	}
 
-	attackInput := filepath.Join(outputDir, safe+"-atk-in.txt")
-	os.WriteFile(attackInput, []byte(strings.Join(allFilterResults, "\n")), 0644)
-
 	// Phase 4: Heavy Attack
 	logLine("PHASE", X_purple, "4/5 Executing Heavy Attacks & DOM Scan...")
-	finalX9Base := filepath.Join(outputDir, safe+"-final")
-	runCommand("./x9", "-i", attackInput, "-json", "-headers", "-o", finalX9Base)
 
-	finalFiles := []string{finalX9Base + ".get", finalX9Base + ".json", finalX9Base + ".header"}
-	for _, ff := range finalFiles {
-		if _, err := os.Stat(ff); err == nil {
-			// Reflection Scan
-			if findings, _ := runCommand("nuclei", "-l", ff, "-t", nucleiTemplate, "-silent"); findings != "" {
-				lines := strings.Split(strings.TrimSpace(findings), "\n")
-				uniqueFindings := dedupeNucleiFindings(lines)
-				logLine("VULN", X_red, "Found %d Reflections in %s!", len(uniqueFindings), ff)
-				tg.notify(targetURL, uniqueFindings, "Reflection")
-			}
+	// 4.1: HTTP Heavy Attack
+	if len(httpConfirmed) > 0 {
+		atkIn := filepath.Join(outputDir, safe+"-http-atk-in.txt")
+		os.WriteFile(atkIn, []byte(strings.Join(httpConfirmed, "\n")), 0644)
+		finalX9Base := filepath.Join(outputDir, safe+"-final-http")
+		runCommand("./x9", "-i", atkIn, "-json", "-headers", "-o", finalX9Base)
 
-			// DOM Scan (only makes sense for GET/URLs usually, but we try anyway or filter)
-			if strings.HasSuffix(ff, ".get") {
-				if dom, _ := runCommand("nuclei", "-l", ff, "-t", domTemplate, "-headless", "-silent"); dom != "" {
-					lines := strings.Split(strings.TrimSpace(dom), "\n")
+		finalFiles := []string{finalX9Base + ".get", finalX9Base + ".json", finalX9Base + ".header"}
+		for _, ff := range finalFiles {
+			if _, err := os.Stat(ff); err == nil {
+				if findings, _ := runCommand("nuclei", "-l", ff, "-t", nucleiTemplate, "-silent"); findings != "" {
+					lines := strings.Split(strings.TrimSpace(findings), "\n")
 					uniqueFindings := dedupeNucleiFindings(lines)
-					logLine("VULN", X_red, "Found %d DOM XSS!", len(uniqueFindings))
-					tg.notify(targetURL, uniqueFindings, "DOM")
+					logLine("VULN", X_red, "Found %d Reflections in %s!", len(uniqueFindings), ff)
+					tg.notify(targetURL, uniqueFindings, "Reflection")
 				}
+			}
+		}
+	}
+
+	// 4.2: DOM Heavy Attack (Only for DOM-confirmed parameters)
+	if len(domConfirmed) > 0 {
+		logLine("INFO", X_gray, "Running heavy DOM scan for %d confirmed parameters...", len(domConfirmed))
+		atkIn := filepath.Join(outputDir, safe+"-dom-atk-in.txt")
+		os.WriteFile(atkIn, []byte(strings.Join(domConfirmed, "\n")), 0644)
+		finalX9Base := filepath.Join(outputDir, safe+"-final-dom")
+		runCommand("./x9", "-i", atkIn, "-o", finalX9Base)
+
+		ff := finalX9Base + ".get"
+		if _, err := os.Stat(ff); err == nil {
+			// Added timeout to headless scan
+			if dom, _ := runCommand("nuclei", "-l", ff, "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
+				lines := strings.Split(strings.TrimSpace(dom), "\n")
+				uniqueFindings := dedupeNucleiFindings(lines)
+				logLine("VULN", X_red, "Found %d DOM XSS!", len(uniqueFindings))
+				tg.notify(targetURL, uniqueFindings, "DOM")
 			}
 		}
 	}
