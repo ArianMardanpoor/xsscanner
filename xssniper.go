@@ -56,6 +56,7 @@ func newTelegram() *Telegram {
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	chatID := os.Getenv("TELEGRAM_CHAT_ID")
 	if token == "" || chatID == "" {
+		logLine("INFO", X_yellow, "Telegram configuration missing. Notifications disabled.")
 		return nil
 	}
 	return &Telegram{Token: token, ChatID: chatID}
@@ -169,8 +170,13 @@ func uniqueStrings(input []string) []string {
 	var result []string
 	for _, s := range input {
 		s = strings.TrimSpace(s)
-		if s != "" && !seen[s] {
-			seen[s] = true
+		if s == "" {
+			continue
+		}
+		// Basic normalization: remove trailing slash
+		u := strings.TrimSuffix(s, "/")
+		if !seen[u] {
+			seen[u] = true
 			result = append(result, s)
 		}
 	}
@@ -306,6 +312,8 @@ func processURL(targetURL string, index, total int) {
 	runCommand("./x9", "-i", attackInput, "-json", "-headers", "-o", finalX9Base)
 
 	finalFiles := []string{finalX9Base + ".get", finalX9Base + ".json", finalX9Base + ".header"}
+	var allTargetFindings []string
+
 	for _, ff := range finalFiles {
 		if _, err := os.Stat(ff); err == nil {
 			// Deduplicate the input file to speed up Nuclei and reduce redundant requests
@@ -314,19 +322,29 @@ func processURL(targetURL string, index, total int) {
 			// Reflection Scan
 			if findings, _ := runCommand("nuclei", "-l", dedupedFile, "-t", nucleiTemplate, "-silent"); findings != "" {
 				uniqueFindings := dedupeNucleiFindings(findings)
-				logLine("VULN", X_red, "Found %d Unique Reflections in %s! (Original: %d)", len(uniqueFindings), ff, len(strings.Split(strings.TrimSpace(findings), "\n")))
-				tg.notify(targetURL, uniqueFindings, "Reflection")
+				logLine("VULN", X_red, "Found %d Unique Reflections in %s!", len(uniqueFindings), ff)
+				for _, f := range uniqueFindings {
+					logLine("FINDING", X_yellow, "-> %s", f)
+					allTargetFindings = append(allTargetFindings, f)
+				}
 			}
 
 			// DOM Scan (only makes sense for GET/URLs usually, but we try anyway or filter)
 			if strings.HasSuffix(ff, ".get") {
 				if dom, _ := runCommand("nuclei", "-l", dedupedFile, "-t", domTemplate, "-headless", "-silent"); dom != "" {
 					uniqueDOM := dedupeNucleiFindings(dom)
-					logLine("VULN", X_red, "Found %d Unique DOM XSS! (Original: %d)", len(uniqueDOM), len(strings.Split(strings.TrimSpace(dom), "\n")))
-					tg.notify(targetURL, uniqueDOM, "DOM")
+					logLine("VULN", X_red, "Found %d Unique DOM XSS!", len(uniqueDOM))
+					for _, f := range uniqueDOM {
+						logLine("FINDING", X_yellow, "-> [DOM] %s", f)
+						allTargetFindings = append(allTargetFindings, "[DOM] "+f)
+					}
 				}
 			}
 		}
+	}
+
+	if len(allTargetFindings) > 0 {
+		tg.notify(targetURL, uniqueStrings(allTargetFindings), "Consolidated")
 	}
 }
 
@@ -399,6 +417,9 @@ func main() {
 	if so, _ := runCommand("nuclei", "-l", finalIn, "-t", nucleiTemplate, "-silent"); so != "" {
 		uniqueSO := dedupeNucleiFindings(so)
 		logLine("VULN", X_red, "Found %d Unique Second-Order XSS vulnerabilities!", len(uniqueSO))
+		for _, f := range uniqueSO {
+			logLine("FINDING", X_yellow, "-> [SO] %s", f)
+		}
 		tg.notify("Global Second-Order Check", uniqueSO, "Second-Order")
 	}
 
