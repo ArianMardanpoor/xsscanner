@@ -1,0 +1,40 @@
+id: dom-canary-headless
+
+info:
+  name: DOM Canary Reflection Detection (Headless)
+  author: jules
+  severity: info
+  description: Detects simple canary reflection in DOM to identify potentially vulnerable parameters for DOM XSS.
+  tags: headless, dom, canary
+
+headless:
+  - steps:
+      - action: navigate
+        args:
+          url: "{{BaseURL}}"
+
+      - action: waitload
+
+      - action: script
+        args:
+          code: |
+            (function() {
+              const pattern = /x9canary[a-z]{3}/;
+              if (pattern.test(document.documentElement.innerHTML)) {
+                return "Found Canary in HTML";
+              }
+              return "";
+            })()
+        name: dom_canary_reflection
+
+    matchers:
+      - type: word
+        part: dom_canary_reflection
+        words:
+          - "Found Canary in HTML"
+
+    extractors:
+      - type: regex
+        part: dom_canary_reflection
+        regex:
+          - "Found Canary in HTML"
