@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,8 +62,33 @@ func newTelegram() *Telegram {
 	return &Telegram{Token: token, ChatID: chatID}
 }
 
+func dedupeNucleiFindings(findings []string) []string {
+	// Group findings by: TemplateID + URL (without payload part)
+	// Example line: [x9-v2-reflection-matcher] [http] [info] http://localhost:2121/test.php?p=x9canaryabc [x9canaryabc]
+	// We want to keep only one finding per URL+Template if the payload is just a variation.
+
+	// For x9, we redact the randomized part: x9[a-z]{3}
+	reX9 := regexp.MustCompile(`x9(?:canary)?[a-z]{3}['\"` + "`" + `\\;<{]*`)
+
+	seen := make(map[string]bool)
+	var unique []string
+
+	for _, f := range findings {
+		// Redact the x9 payload to normalize the finding line
+		normalizedLine := reX9.ReplaceAllString(f, "x9REDACTED")
+		if !seen[normalizedLine] {
+			seen[normalizedLine] = true
+			unique = append(unique, f)
+		}
+	}
+	return unique
+}
+
 func (tg *Telegram) notify(targetURL string, findings []string, scanType string) {
 	if tg == nil {
+		for _, f := range findings {
+			fmt.Printf("%s[FINDING]%s -> %s\n", X_green, X_reset, f)
+		}
 		return
 	}
 	ts := time.Now().Format("2006-01-02 15:04:05")
@@ -188,19 +214,30 @@ func processURL(targetURL string, index, total int) {
 		logLine("ERROR", X_red, "x9 probe failed: %v", err)
 	}
 
-	// Phase 3: Filter Vulnerable Parameters
+	// Phase 3: Filter Vulnerable Parameters (HTTP & DOM)
 	logLine("PHASE", X_blue, "3/5 Filtering reflective parameters...")
 	// We check GET, JSON, and Header probes
 	probeFiles := []string{probeOutputBase + ".get", probeOutputBase + ".json", probeOutputBase + ".header"}
 	var allFilterResults []string
 	for _, pf := range probeFiles {
 		if _, err := os.Stat(pf); err == nil {
+			// HTTP Canary
 			res, _ := runCommand("nuclei", "-l", pf, "-t", canaryTemplate, "-silent")
 			if res != "" {
 				allFilterResults = append(allFilterResults, extractURLsFromNuclei(res)...)
 			}
+
+			// DOM Canary (Only for GET/URLs)
+			if strings.HasSuffix(pf, ".get") {
+				resDom, _ := runCommand("nuclei", "-l", pf, "-t", "dom_canary.yaml", "-headless", "-silent")
+				if resDom != "" {
+					allFilterResults = append(allFilterResults, extractURLsFromNuclei(resDom)...)
+				}
+			}
 		}
 	}
+
+	allFilterResults = uniqueStrings(allFilterResults)
 
 	if len(allFilterResults) == 0 {
 		logLine("INFO", X_gray, "No reflective parameters found. Skipping heavy attacks.")
@@ -221,20 +258,47 @@ func processURL(targetURL string, index, total int) {
 			// Reflection Scan
 			if findings, _ := runCommand("nuclei", "-l", ff, "-t", nucleiTemplate, "-silent"); findings != "" {
 				lines := strings.Split(strings.TrimSpace(findings), "\n")
-				logLine("VULN", X_red, "Found %d Reflections in %s!", len(lines), ff)
-				tg.notify(targetURL, lines, "Reflection")
+				uniqueFindings := dedupeNucleiFindings(lines)
+				logLine("VULN", X_red, "Found %d Reflections in %s!", len(uniqueFindings), ff)
+				tg.notify(targetURL, uniqueFindings, "Reflection")
 			}
 
 			// DOM Scan (only makes sense for GET/URLs usually, but we try anyway or filter)
 			if strings.HasSuffix(ff, ".get") {
 				if dom, _ := runCommand("nuclei", "-l", ff, "-t", domTemplate, "-headless", "-silent"); dom != "" {
 					lines := strings.Split(strings.TrimSpace(dom), "\n")
-					logLine("VULN", X_red, "Found %d DOM XSS!", len(lines))
-					tg.notify(targetURL, lines, "DOM")
+					uniqueFindings := dedupeNucleiFindings(lines)
+					logLine("VULN", X_red, "Found %d DOM XSS!", len(uniqueFindings))
+					tg.notify(targetURL, uniqueFindings, "DOM")
 				}
 			}
 		}
 	}
+}
+
+func uniqueStrings(slice []string) []string {
+	keys := make(map[string]bool)
+	var list []string
+	for _, entry := range slice {
+		u, err := url.Parse(entry)
+		if err != nil {
+			if !keys[entry] {
+				keys[entry] = true
+				list = append(list, entry)
+			}
+			continue
+		}
+		// Basic normalization
+		if u.Path == "/" {
+			u.Path = ""
+		}
+		normalized := u.String()
+		if !keys[normalized] {
+			keys[normalized] = true
+			list = append(list, entry)
+		}
+	}
+	return list
 }
 
 func main() {
@@ -272,11 +336,14 @@ func main() {
 	for scanner.Scan() {
 		if u := strings.TrimSpace(scanner.Text()); u != "" {
 			urls = append(urls, u)
-			mu.Lock()
-			allCrawledURLs = append(allCrawledURLs, u)
-			mu.Unlock()
 		}
 	}
+
+	urls = uniqueStrings(urls)
+
+	mu.Lock()
+	allCrawledURLs = append(allCrawledURLs, urls...)
+	mu.Unlock()
 
 	logLine("INFO", X_cyan, "Starting Pipeline for %d targets with %d workers...", len(urls), workers)
 
@@ -296,11 +363,13 @@ func main() {
 	// Phase 5: Final Second-Order XSS Check
 	logLine("PHASE", X_white, "5/5 Final Second-Order Check on all discovered URLs...")
 	finalIn := filepath.Join(outputDir, "all_crawled_discovery.txt")
-	os.WriteFile(finalIn, []byte(strings.Join(allCrawledURLs, "\n")), 0644)
+	uniqueCrawled := uniqueStrings(allCrawledURLs)
+	os.WriteFile(finalIn, []byte(strings.Join(uniqueCrawled, "\n")), 0644)
 	if so, _ := runCommand("nuclei", "-l", finalIn, "-t", nucleiTemplate, "-silent"); so != "" {
 		lines := strings.Split(strings.TrimSpace(so), "\n")
-		logLine("VULN", X_red, "Found %d Second-Order XSS vulnerabilities!", len(lines))
-		tg.notify("Global Second-Order Check", lines, "Second-Order")
+		uniqueFindings := dedupeNucleiFindings(lines)
+		logLine("VULN", X_red, "Found %d Second-Order XSS vulnerabilities!", len(uniqueFindings))
+		tg.notify("Global Second-Order Check", uniqueFindings, "Second-Order")
 	}
 
 	fmt.Printf("\n%s[DONE]%s Full Recon & XSS Pipeline Complete.\n", X_green, X_reset)

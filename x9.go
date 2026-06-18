@@ -118,14 +118,21 @@ func buildURL(base *ParsedURL, params map[string]string) string {
 	return u.String()
 }
 
-func getAllParams(originalParams map[string]string, paramFile string) []string {
+func getAllParams(originalParams map[string]string, paramFile string, probeMode bool) []string {
 	allParamsMap := make(map[string]bool)
 	for k := range originalParams {
 		allParamsMap[k] = true
 	}
-	for _, p := range defaultParams {
-		allParamsMap[p] = true
+
+	// Only add default params if we are in probe mode OR if we have NO parameters yet.
+	// If we are in attack mode and already have parameters (from canary phase),
+	// we only want to attack those specific parameters.
+	if probeMode || len(allParamsMap) == 0 {
+		for _, p := range defaultParams {
+			allParamsMap[p] = true
+		}
 	}
+
 	if paramFile != "" {
 		file, err := os.Open(paramFile)
 		if err == nil {
@@ -218,7 +225,7 @@ func main() {
 			payloads = getBreakPayloads()
 		}
 
-		allParams := getAllParams(base.Params, paramFile)
+		allParams := getAllParams(base.Params, paramFile, probeMode)
 
 		for _, payload := range payloads {
 			// 1. Standard URL Parameters
