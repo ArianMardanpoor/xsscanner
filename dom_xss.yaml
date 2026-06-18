@@ -51,3 +51,4 @@ headless:
         part: dom_reflection
         regex:
           - "Found in HTML"
+        internal: true # Prevent redundant output in CLI

@@ -220,9 +220,19 @@ func main() {
 
 		allParams := getAllParams(base.Params, paramFile)
 
+		// Optimization: If we have existing parameters and we are not in probe mode,
+		// we should primarily focus on attacking those existing parameters.
+		paramsToAttack := allParams
+		if !probeMode && len(base.Params) > 0 {
+			paramsToAttack = []string{}
+			for k := range base.Params {
+				paramsToAttack = append(paramsToAttack, k)
+			}
+		}
+
 		for _, payload := range payloads {
 			// 1. Standard URL Parameters
-			for _, p := range allParams {
+			for _, p := range paramsToAttack {
 				newParams := make(map[string]string)
 				for k, v := range base.Params {
 					newParams[k] = v

@@ -161,7 +161,59 @@ func extractURLsFromNuclei(nucleiOutput string) []string {
 			}
 		}
 	}
-	return urls
+	return uniqueStrings(urls)
+}
+
+func uniqueStrings(input []string) []string {
+	seen := make(map[string]bool)
+	var result []string
+	for _, s := range input {
+		s = strings.TrimSpace(s)
+		if s != "" && !seen[s] {
+			seen[s] = true
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+func dedupeNucleiFindings(findings string) []string {
+	lines := strings.Split(strings.TrimSpace(findings), "\n")
+	seen := make(map[string]bool)
+	var result []string
+
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		// Try to create a unique key: template-id + simplified URL
+		// We remove the specific x9 payload from the URL to deduplicate repeated attacks on same param
+		parts := strings.Fields(line)
+		if len(parts) < 4 {
+			result = append(result, line)
+			continue
+		}
+
+		templateID := parts[0]
+		targetURL := ""
+		for _, p := range parts {
+			if strings.HasPrefix(p, "http") {
+				targetURL = strings.Trim(p, "[]")
+				break
+			}
+		}
+
+		// Simplify URL by replacing x9 payload values with a placeholder
+		re := regexp.MustCompile(`x9[a-z]{3}['\"` + "`" + `\\;<{]*`)
+		simpleURL := re.ReplaceAllString(targetURL, "REDACTED")
+
+		key := templateID + "|" + simpleURL
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, line)
+		}
+	}
+	return result
 }
 
 // ── Core Logic ────────────────────────────────────────────────────────────────
@@ -202,6 +254,8 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 
+	allFilterResults = uniqueStrings(allFilterResults)
+
 	if len(allFilterResults) == 0 {
 		logLine("INFO", X_gray, "No reflective parameters found. Skipping heavy attacks.")
 		return
@@ -220,17 +274,17 @@ func processURL(targetURL string, index, total int) {
 		if _, err := os.Stat(ff); err == nil {
 			// Reflection Scan
 			if findings, _ := runCommand("nuclei", "-l", ff, "-t", nucleiTemplate, "-silent"); findings != "" {
-				lines := strings.Split(strings.TrimSpace(findings), "\n")
-				logLine("VULN", X_red, "Found %d Reflections in %s!", len(lines), ff)
-				tg.notify(targetURL, lines, "Reflection")
+				uniqueFindings := dedupeNucleiFindings(findings)
+				logLine("VULN", X_red, "Found %d Unique Reflections in %s! (Original: %d)", len(uniqueFindings), ff, len(strings.Split(strings.TrimSpace(findings), "\n")))
+				tg.notify(targetURL, uniqueFindings, "Reflection")
 			}
 
 			// DOM Scan (only makes sense for GET/URLs usually, but we try anyway or filter)
 			if strings.HasSuffix(ff, ".get") {
 				if dom, _ := runCommand("nuclei", "-l", ff, "-t", domTemplate, "-headless", "-silent"); dom != "" {
-					lines := strings.Split(strings.TrimSpace(dom), "\n")
-					logLine("VULN", X_red, "Found %d DOM XSS!", len(lines))
-					tg.notify(targetURL, lines, "DOM")
+					uniqueDOM := dedupeNucleiFindings(dom)
+					logLine("VULN", X_red, "Found %d Unique DOM XSS! (Original: %d)", len(uniqueDOM), len(strings.Split(strings.TrimSpace(dom), "\n")))
+					tg.notify(targetURL, uniqueDOM, "DOM")
 				}
 			}
 		}
@@ -272,11 +326,13 @@ func main() {
 	for scanner.Scan() {
 		if u := strings.TrimSpace(scanner.Text()); u != "" {
 			urls = append(urls, u)
-			mu.Lock()
-			allCrawledURLs = append(allCrawledURLs, u)
-			mu.Unlock()
 		}
 	}
+	urls = uniqueStrings(urls)
+
+	mu.Lock()
+	allCrawledURLs = append(allCrawledURLs, urls...)
+	mu.Unlock()
 
 	logLine("INFO", X_cyan, "Starting Pipeline for %d targets with %d workers...", len(urls), workers)
 
@@ -295,12 +351,16 @@ func main() {
 
 	// Phase 5: Final Second-Order XSS Check
 	logLine("PHASE", X_white, "5/5 Final Second-Order Check on all discovered URLs...")
+	mu.Lock()
+	allCrawledURLs = uniqueStrings(allCrawledURLs)
+	mu.Unlock()
+
 	finalIn := filepath.Join(outputDir, "all_crawled_discovery.txt")
 	os.WriteFile(finalIn, []byte(strings.Join(allCrawledURLs, "\n")), 0644)
 	if so, _ := runCommand("nuclei", "-l", finalIn, "-t", nucleiTemplate, "-silent"); so != "" {
-		lines := strings.Split(strings.TrimSpace(so), "\n")
-		logLine("VULN", X_red, "Found %d Second-Order XSS vulnerabilities!", len(lines))
-		tg.notify("Global Second-Order Check", lines, "Second-Order")
+		uniqueSO := dedupeNucleiFindings(so)
+		logLine("VULN", X_red, "Found %d Unique Second-Order XSS vulnerabilities!", len(uniqueSO))
+		tg.notify("Global Second-Order Check", uniqueSO, "Second-Order")
 	}
 
 	fmt.Printf("\n%s[DONE]%s Full Recon & XSS Pipeline Complete.\n", X_green, X_reset)
