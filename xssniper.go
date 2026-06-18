@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -204,6 +205,11 @@ func dedupeConfirmedURLs(urls []string) []string {
 }
 
 func (tg *Telegram) notify(targetURL string, findings []string, scanType string) {
+	if len(findings) > 0 {
+		if _, loaded := vulnerableMap.LoadOrStore(targetURL, true); !loaded {
+			atomic.AddInt64(&vulnerableTargets, 1)
+		}
+	}
 	if tg == nil {
 		for _, f := range findings {
 			fmt.Printf("%s[FINDING]%s -> %s\n", X_green, X_reset, f)
@@ -259,16 +265,19 @@ const (
 )
 
 var (
-	outputDir      string
-	nucleiTemplate string
-	domTemplate    string
-	canaryTemplate string
-	paramFile      string
-	concurrency    int
-	workers        int
-	mu             sync.Mutex
-	tg             *Telegram
-	allCrawledURLs []string
+	outputDir         string
+	nucleiTemplate    string
+	domTemplate       string
+	canaryTemplate    string
+	paramFile         string
+	concurrency       int
+	workers           int
+	mu                sync.Mutex
+	tg                *Telegram
+	allCrawledURLs    []string
+	processedTargets  int64
+	vulnerableTargets int64
+	vulnerableMap     sync.Map
 )
 
 func logLine(level, color, format string, args ...interface{}) {
@@ -312,7 +321,11 @@ func extractURLsFromNuclei(nucleiOutput string) []string {
 // ── Core Logic ────────────────────────────────────────────────────────────────
 
 func processURL(targetURL string, index, total int) {
-	logLine("TARGET", X_white, "[%d/%d] %s", index, total, targetURL)
+	atomic.AddInt64(&processedTargets, 1)
+	currProcessed := atomic.LoadInt64(&processedTargets)
+	currVulns := atomic.LoadInt64(&vulnerableTargets)
+
+	logLine("TARGET", X_white, "[%d/%d | Vulns: %d] %s", currProcessed, total, currVulns, targetURL)
 	safe := regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(targetURL, "_")
 
 	// Phase 2: Canary Probe
