@@ -1,0 +1,7 @@
+http://localhost:2121/test.php?message=x9qia%27
+http://localhost:2121/test.php?message=x9qia%22
+http://localhost:2121/test.php?message=x9qia%60
+http://localhost:2121/test.php?message=x9qia%5C%27
+http://localhost:2121/test.php?message=x9qia%3C
+http://localhost:2121/test.php?message=x9qia%3B
+http://localhost:2121/test.php?message=x9qia%7B%7B

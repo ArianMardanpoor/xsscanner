@@ -20,9 +20,8 @@ headless:
           code: |
             (function() {
               const pattern = /x9canary[a-z]{3}/;
-              if (pattern.test(document.documentElement.innerHTML)) {
-                return "Found Canary in HTML";
-              }
+              const content = document.documentElement.outerHTML;
+              if (pattern.test(content)) return "Found Canary in DOM";
               return "";
             })()
         name: dom_canary_reflection
@@ -31,10 +30,10 @@ headless:
       - type: word
         part: dom_canary_reflection
         words:
-          - "Found Canary in HTML"
+          - "Found Canary in DOM"
 
     extractors:
       - type: regex
         part: dom_canary_reflection
         regex:
-          - "Found Canary in HTML"
+          - "Found Canary in DOM"
