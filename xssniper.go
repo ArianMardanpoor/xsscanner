@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -63,14 +64,14 @@ func newTelegram() *Telegram {
 }
 
 func dedupeNucleiFindings(findings []string) []string {
-	// Pattern to match x9 payloads, including URL encoded characters
-	reX9 := regexp.MustCompile(`x9(?:canary)?[a-z]{3}(?:['\"` + "`" + `\\;<{]|%[0-9a-fA-F]{2})*`)
-	rePayload := regexp.MustCompile(`\["([^"]+)"\]$`)
+	reX9 := regexp.MustCompile(`x9(?:canary)?[a-z]{3}`)
+	// Matches [payload] or ["payload"] at the end of the line
+	rePayload := regexp.MustCompile(`\[(?:"([^"]+)"|([^"\]]+))\]$`)
 
 	type Group struct {
-		BaseURL  string
-		Payloads []string
-		Seen     map[string]bool
+		DisplayURL string
+		Payloads   []string
+		Seen       map[string]bool
 	}
 
 	groups := make(map[string]*Group)
@@ -82,52 +83,90 @@ func dedupeNucleiFindings(findings []string) []string {
 			continue
 		}
 
-		// Extract payload
-		var currentPayload string
-		if m := rePayload.FindStringSubmatch(f); len(m) > 1 {
-			currentPayload = m[1]
+		// 1. Extract payload
+		var payload string
+		if m := rePayload.FindStringSubmatch(f); len(m) > 0 {
+			if m[1] != "" {
+				payload = m[1]
+			} else {
+				payload = m[2]
+			}
 		}
 
-		// Grouping key: URL with redacted x9 payload
-		key := reX9.ReplaceAllString(f, "x9REDACTED")
-		key = rePayload.ReplaceAllString(key, "")
-		key = strings.TrimSpace(key)
+		// 2. Extract original URL from line
+		originalURL := ""
+		parts := strings.Fields(f)
+		for _, p := range parts {
+			if strings.HasPrefix(p, "http") {
+				originalURL = strings.Trim(p, "[]")
+				break
+			}
+		}
+		if originalURL == "" {
+			continue
+		}
 
-		if _, ok := groups[key]; !ok {
-			// Extract just the URL part
-			parts := strings.Fields(key)
-			urlPart := ""
-			for _, p := range parts {
-				if strings.HasPrefix(p, "http") {
-					urlPart = p
-					break
+		// 3. Create Grouping Key
+		keyLine := rePayload.ReplaceAllString(f, "")
+		groupKey := reX9.ReplaceAllString(keyLine, "x9")
+		groupKey = strings.TrimSpace(groupKey)
+
+		if _, ok := groups[groupKey]; !ok {
+			// Clean up display URL
+			displayURL := originalURL
+			if strings.Contains(displayURL, "|") || strings.Contains(displayURL, "%7C") {
+				displayURL = strings.ReplaceAll(displayURL, "%7C", "|")
+				sub := strings.SplitN(displayURL, "|", 2)
+				if len(sub) == 2 {
+					target := sub[0]
+					injection := sub[1]
+					if strings.HasPrefix(injection, "{") {
+						displayURL = fmt.Sprintf("%s (JSON Body)", target)
+					} else {
+						displayURL = fmt.Sprintf("%s (Injection: %s)", target, injection)
+					}
 				}
 			}
-			groups[key] = &Group{
-				BaseURL: urlPart,
-				Seen:    make(map[string]bool),
+			// Redact x9 from display URL for a cleaner look
+			displayURL = reX9.ReplaceAllString(displayURL, "x9")
+
+			// De-duplicate parameters in display URL
+			if u, err := url.Parse(displayURL); err == nil {
+				q := u.Query()
+				for k, v := range q {
+					if len(v) > 1 {
+						q.Set(k, v[0])
+					}
+				}
+				u.RawQuery = q.Encode()
+				displayURL = u.String()
 			}
-			order = append(order, key)
+
+			groups[groupKey] = &Group{
+				DisplayURL: displayURL,
+				Seen:       make(map[string]bool),
+			}
+			order = append(order, groupKey)
 		}
 
-		if currentPayload != "" && !groups[key].Seen[currentPayload] {
-			groups[key].Seen[currentPayload] = true
-			groups[key].Payloads = append(groups[key].Payloads, currentPayload)
+		if payload != "" && !groups[groupKey].Seen[payload] {
+			groups[groupKey].Seen[payload] = true
+			groups[groupKey].Payloads = append(groups[groupKey].Payloads, payload)
 		}
 	}
 
 	var result []string
 	for _, key := range order {
 		g := groups[key]
-		if g.BaseURL == "" {
-			continue
+		if len(g.Payloads) > 0 {
+			quoted := make([]string, len(g.Payloads))
+			for i, p := range g.Payloads {
+				quoted[i] = fmt.Sprintf("\"%s\"", p)
+			}
+			result = append(result, fmt.Sprintf("%s [%s]", g.DisplayURL, strings.Join(quoted, ", ")))
+		} else {
+			result = append(result, g.DisplayURL)
 		}
-
-		quoted := make([]string, len(g.Payloads))
-		for i, p := range g.Payloads {
-			quoted[i] = fmt.Sprintf("\"%s\"", p)
-		}
-		result = append(result, fmt.Sprintf("%s [%s]", g.BaseURL, strings.Join(quoted, ", ")))
 	}
 	return result
 }
@@ -135,22 +174,28 @@ func dedupeNucleiFindings(findings []string) []string {
 func dedupeConfirmedURLs(urls []string) []string {
 	seen := make(map[string]bool)
 	var unique []string
-	reX9 := regexp.MustCompile(`x9(?:canary)?[a-z]{3}(?:%[0-9a-fA-F]{2}|.)*`)
+	reX9 := regexp.MustCompile(`x9(?:canary)?[a-z]{3}`)
 	for _, u := range urls {
-		// Ensure we don't have duplicated parameters in the URL itself
-		parsed, err := url.Parse(u)
+		normalized := u
+		uParsed, err := url.Parse(u)
 		if err == nil {
-			query := parsed.Query()
-			for k, v := range query {
-				if len(v) > 1 {
-					query.Set(k, v[0])
-				}
+			// Redact x9 in query values for grouping
+			q := uParsed.Query()
+			newQuery := url.Values{}
+			for k, v := range q {
+				val := v[0]
+				val = reX9.ReplaceAllString(val, "x9")
+				newQuery.Set(k, val)
 			}
-			parsed.RawQuery = query.Encode()
-			u = parsed.String()
+			uParsed.RawQuery = newQuery.Encode()
+			if uParsed.Path == "/" {
+				uParsed.Path = ""
+			}
+			normalized = uParsed.String()
+		} else {
+			normalized = reX9.ReplaceAllString(u, "x9")
 		}
 
-		normalized := reX9.ReplaceAllString(u, "x9REDACTED")
 		if !seen[normalized] {
 			seen[normalized] = true
 			unique = append(unique, u)
@@ -160,6 +205,11 @@ func dedupeConfirmedURLs(urls []string) []string {
 }
 
 func (tg *Telegram) notify(targetURL string, findings []string, scanType string) {
+	if len(findings) > 0 {
+		if _, loaded := vulnerableMap.LoadOrStore(targetURL, true); !loaded {
+			atomic.AddInt64(&vulnerableTargets, 1)
+		}
+	}
 	if tg == nil {
 		for _, f := range findings {
 			fmt.Printf("%s[FINDING]%s -> %s\n", X_green, X_reset, f)
@@ -215,16 +265,19 @@ const (
 )
 
 var (
-	outputDir      string
-	nucleiTemplate string
-	domTemplate    string
-	canaryTemplate string
-	paramFile      string
-	concurrency    int
-	workers        int
-	mu             sync.Mutex
-	tg             *Telegram
-	allCrawledURLs []string
+	outputDir         string
+	nucleiTemplate    string
+	domTemplate       string
+	canaryTemplate    string
+	paramFile         string
+	concurrency       int
+	workers           int
+	mu                sync.Mutex
+	tg                *Telegram
+	allCrawledURLs    []string
+	processedTargets  int64
+	vulnerableTargets int64
+	vulnerableMap     sync.Map
 )
 
 func logLine(level, color, format string, args ...interface{}) {
@@ -268,7 +321,11 @@ func extractURLsFromNuclei(nucleiOutput string) []string {
 // ── Core Logic ────────────────────────────────────────────────────────────────
 
 func processURL(targetURL string, index, total int) {
-	logLine("TARGET", X_white, "[%d/%d] %s", index, total, targetURL)
+	atomic.AddInt64(&processedTargets, 1)
+	currProcessed := atomic.LoadInt64(&processedTargets)
+	currVulns := atomic.LoadInt64(&vulnerableTargets)
+
+	logLine("TARGET", X_white, "[%d/%d | Vulns: %d] %s", currProcessed, total, currVulns, targetURL)
 	safe := regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(targetURL, "_")
 
 	// Phase 2: Canary Probe
