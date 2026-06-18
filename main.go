@@ -28,9 +28,9 @@ const (
 )
 
 var (
-	apiURL         = "http://localhost:3131/api/http"
-	apiToken       = os.Getenv("WATCHTOWER_API_TOKEN")
-	oldTargetsFile = "all_scanned_targets.txt"
+	apiURL          = "http://localhost:3131/api/http"
+	apiToken        = os.Getenv("WATCHTOWER_API_TOKEN")
+	oldTargetsFile  = "all_scanned_targets.txt"
 	globalOutputDir = "./results"
 )
 
@@ -232,34 +232,41 @@ func processTarget(target string, mode string) {
 func main() {
 	mode := flag.String("mode", "normal", "Scan mode: normal or fresh")
 	inputFile := flag.String("i", "", "Input file with targets (skips API)")
+	targetURL := flag.String("u", "", "Single target URL to scan")
 	flag.Parse()
 
-	var rawTargets []string
-	if *inputFile != "" {
-		file, err := os.Open(*inputFile)
-		if err != nil {
-			logMsg(fmt.Sprintf("Error opening input file: %v", err), M_red)
+	var newTargets []string
+
+	if *targetURL != "" {
+		newTargets = []string{*targetURL}
+		logMsg(fmt.Sprintf("Single target mode: %s", *targetURL), M_cyan)
+	} else {
+		var rawTargets []string
+		if *inputFile != "" {
+			file, err := os.Open(*inputFile)
+			if err != nil {
+				logMsg(fmt.Sprintf("Error opening input file: %v", err), M_red)
+				return
+			}
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				if t := strings.TrimSpace(scanner.Text()); t != "" {
+					rawTargets = append(rawTargets, t)
+				}
+			}
+			file.Close()
+		} else {
+			rawTargets = fetchDataFromAPI(*mode)
+		}
+		if len(rawTargets) == 0 {
 			return
 		}
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			if t := strings.TrimSpace(scanner.Text()); t != "" {
-				rawTargets = append(rawTargets, t)
-			}
-		}
-		file.Close()
-	} else {
-		rawTargets = fetchDataFromAPI(*mode)
-	}
-	if len(rawTargets) == 0 {
-		return
-	}
 
-	var newTargets []string
-	if *mode == "fresh" {
-		newTargets = rawTargets
-	} else {
-		newTargets = getNewTargetsOnly(rawTargets)
+		if *mode == "fresh" {
+			newTargets = rawTargets
+		} else {
+			newTargets = getNewTargetsOnly(rawTargets)
+		}
 	}
 
 	if len(newTargets) == 0 {
