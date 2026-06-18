@@ -25,6 +25,159 @@ type Telegram struct {
 	ChatID string
 }
 
+// ── Vulnerability Reporting ──────────────────────────────────────────────────
+
+type Vulnerability struct {
+	Name     string   `json:"parameter,omitempty"` // parameter name, header name, or json key
+	Payloads []string `json:"payloads"`
+}
+
+type VulnerabilityReport struct {
+	URL             string          `json:"url"`
+	QueryParameters []Vulnerability `json:"query_parameters,omitempty"`
+	Headers         []Vulnerability `json:"headers,omitempty"`
+	JSONBody        []Vulnerability `json:"json_body,omitempty"`
+	DOM             []Vulnerability `json:"dom,omitempty"`
+}
+
+func (r *VulnerabilityReport) HasVulns() bool {
+	return len(r.QueryParameters) > 0 || len(r.Headers) > 0 || len(r.JSONBody) > 0 || len(r.DOM) > 0
+}
+
+func redactX9(s string) string {
+	return reX9.ReplaceAllString(s, "x9")
+}
+
+func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase string) {
+	if nucleiOutput == "" {
+		return
+	}
+
+	lines := strings.Split(strings.TrimSpace(nucleiOutput), "\n")
+
+	for _, line := range lines {
+		line = stripANSI(strings.TrimSpace(line))
+		line = reCleaning.ReplaceAllString(line, "")
+		if line == "" {
+			continue
+		}
+
+		// 1. Extract redacted payload
+		payload := ""
+		if m := rePayload.FindStringSubmatch(line); len(m) > 0 {
+			if m[1] != "" {
+				payload = m[1]
+			} else {
+				payload = m[2]
+			}
+		}
+		if payload != "" {
+			payload = redactX9(payload)
+		}
+
+		// 2. Extract URL and injection point
+		rawURL := ""
+		parts := strings.Fields(line)
+		for _, p := range parts {
+			if strings.HasPrefix(p, "http") {
+				rawURL = strings.Trim(p, "[]")
+				break
+			}
+		}
+
+		if rawURL == "" {
+			continue
+		}
+
+		// Parse injection info from URL (format: target|injection)
+		decodedURL, _ := url.QueryUnescape(rawURL)
+		injection := ""
+		if strings.Contains(decodedURL, "|") {
+			sub := strings.SplitN(decodedURL, "|", 2)
+			injection = sub[1]
+		}
+
+		name := "unknown"
+		targetList := &r.QueryParameters
+
+		switch phase {
+		case "header":
+			targetList = &r.Headers
+			if strings.Contains(injection, ":") {
+				name = strings.SplitN(injection, ":", 2)[0]
+			}
+		case "json":
+			targetList = &r.JSONBody
+			if strings.HasPrefix(injection, "{") {
+				var data map[string]interface{}
+				if err := json.Unmarshal([]byte(injection), &data); err == nil {
+					for k, v := range data {
+						valStr := fmt.Sprintf("%v", v)
+						if strings.Contains(redactX9(valStr), "x9") {
+							name = k
+							break
+						}
+					}
+				} else {
+					name = "JSON Body"
+				}
+			}
+		case "dom":
+			targetList = &r.DOM
+			if u, err := url.Parse(decodedURL); err == nil {
+				// Find which query param matches the reflection
+				for k, v := range u.Query() {
+					if strings.Contains(redactX9(strings.Join(v, "")), "x9") {
+						name = k
+						break
+					}
+				}
+			}
+		default: // get or second-order
+			if u, err := url.Parse(decodedURL); err == nil {
+				q := u.Query()
+				for k, v := range q {
+					for _, val := range v {
+						if strings.Contains(redactX9(val), "x9") {
+							name = k
+							goto found
+						}
+					}
+				}
+			}
+		found:
+		}
+
+		// Add to list
+		found := false
+		for i, v := range *targetList {
+			if v.Name == name {
+				if payload != "" {
+					exists := false
+					for _, p := range v.Payloads {
+						if p == payload {
+							exists = true
+							break
+						}
+					}
+					if !exists {
+						(*targetList)[i].Payloads = append((*targetList)[i].Payloads, payload)
+					}
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			newVuln := Vulnerability{Name: name}
+			if payload != "" {
+				newVuln.Payloads = []string{payload}
+			}
+			*targetList = append(*targetList, newVuln)
+		}
+	}
+}
+
 func loadEnv() {
 	candidates := []string{".env"}
 	if exe, err := os.Executable(); err == nil {
@@ -64,10 +217,6 @@ func newTelegram() *Telegram {
 }
 
 func dedupeNucleiFindings(findings []string) []string {
-	reX9 := regexp.MustCompile(`x9(?:canary)?[a-z]{3}`)
-	// Matches [payload] or ["payload"] at the end of the line
-	rePayload := regexp.MustCompile(`\[(?:"([^"]+)"|([^"\]]+))\]$`)
-
 	type Group struct {
 		DisplayURL string
 		Payloads   []string
@@ -108,7 +257,7 @@ func dedupeNucleiFindings(findings []string) []string {
 
 		// 3. Create Grouping Key
 		keyLine := rePayload.ReplaceAllString(f, "")
-		groupKey := reX9.ReplaceAllString(keyLine, "x9")
+		groupKey := redactX9(keyLine)
 		groupKey = strings.TrimSpace(groupKey)
 
 		if _, ok := groups[groupKey]; !ok {
@@ -128,7 +277,7 @@ func dedupeNucleiFindings(findings []string) []string {
 				}
 			}
 			// Redact x9 from display URL for a cleaner look
-			displayURL = reX9.ReplaceAllString(displayURL, "x9")
+			displayURL = redactX9(displayURL)
 
 			// De-duplicate parameters in display URL
 			if u, err := url.Parse(displayURL); err == nil {
@@ -174,7 +323,6 @@ func dedupeNucleiFindings(findings []string) []string {
 func dedupeConfirmedURLs(urls []string) []string {
 	seen := make(map[string]bool)
 	var unique []string
-	reX9 := regexp.MustCompile(`x9(?:canary)?[a-z]{3}`)
 	for _, u := range urls {
 		normalized := u
 		uParsed, err := url.Parse(u)
@@ -184,7 +332,7 @@ func dedupeConfirmedURLs(urls []string) []string {
 			newQuery := url.Values{}
 			for k, v := range q {
 				val := v[0]
-				val = reX9.ReplaceAllString(val, "x9")
+				val = redactX9(val)
 				newQuery.Set(k, val)
 			}
 			uParsed.RawQuery = newQuery.Encode()
@@ -193,7 +341,7 @@ func dedupeConfirmedURLs(urls []string) []string {
 			}
 			normalized = uParsed.String()
 		} else {
-			normalized = reX9.ReplaceAllString(u, "x9")
+			normalized = redactX9(u)
 		}
 
 		if !seen[normalized] {
@@ -204,42 +352,48 @@ func dedupeConfirmedURLs(urls []string) []string {
 	return unique
 }
 
-func (tg *Telegram) notify(targetURL string, findings []string, scanType string) {
-	if len(findings) > 0 {
-		if _, loaded := vulnerableMap.LoadOrStore(targetURL, true); !loaded {
-			atomic.AddInt64(&vulnerableTargets, 1)
-		}
-	}
-	if tg == nil {
-		for _, f := range findings {
-			fmt.Printf("%s[FINDING]%s -> %s\n", X_green, X_reset, f)
-		}
+func (tg *Telegram) notify(report VulnerabilityReport) {
+	if !report.HasVulns() {
 		return
 	}
-	ts := time.Now().Format("2006-01-02 15:04:05")
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🚨 <b>%s XSS Finding!</b>\n\n", scanType))
-	sb.WriteString(fmt.Sprintf("🎯 <b>Target:</b> <code>%s</code>\n", escapeHTML(targetURL)))
-	sb.WriteString(fmt.Sprintf("📅 <b>Time:</b> %s\n", ts))
-	sb.WriteString(fmt.Sprintf("🔢 <b>Count:</b> %d unique endpoint(s)\n\n", len(findings)))
 
-	for i, f := range findings {
-		cleanLine := stripANSI(f)
-		if len(cleanLine) > 3500 {
-			cleanLine = cleanLine[:3500] + "..."
+	if _, loaded := vulnerableMap.LoadOrStore(report.URL, true); !loaded {
+		atomic.AddInt64(&vulnerableTargets, 1)
+	}
+
+	reportJSON, _ := json.MarshalIndent(report, "", "  ")
+
+	// 1. Terminal Output
+	mu.Lock()
+	fmt.Printf("\n%s[VULN FOUND]%s\n%s%s%s\n", X_red+X_bold, X_reset, X_yellow, string(reportJSON), X_reset)
+	mu.Unlock()
+
+	// 2. Save to File
+	vulnDir := filepath.Join(outputDir, "vulnerabilities")
+	os.MkdirAll(vulnDir, 0755)
+	safeName := regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(report.URL, "_")
+	fileName := filepath.Join(vulnDir, safeName+".json")
+	os.WriteFile(fileName, reportJSON, 0644)
+
+	// 3. Telegram Notification
+	if tg != nil {
+		ts := time.Now().Format("2006-01-02 15:04:05")
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("🚨 <b>XSS Finding!</b>\n\n"))
+		sb.WriteString(fmt.Sprintf("🎯 <b>Target:</b> <code>%s</code>\n", escapeHTML(report.URL)))
+		sb.WriteString(fmt.Sprintf("📅 <b>Time:</b> %s\n\n", ts))
+		sb.WriteString(fmt.Sprintf("<pre>%s</pre>", escapeHTML(string(reportJSON))))
+
+		payload := map[string]interface{}{
+			"chat_id":                  tg.ChatID,
+			"text":                     sb.String(),
+			"parse_mode":               "HTML",
+			"disable_web_page_preview": true,
 		}
-		sb.WriteString(fmt.Sprintf("<code>%d. %s</code>\n", i+1, escapeHTML(cleanLine)))
+		body, _ := json.Marshal(payload)
+		apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", tg.Token)
+		http.Post(apiURL, "application/json", bytes.NewReader(body))
 	}
-
-	payload := map[string]interface{}{
-		"chat_id":                  tg.ChatID,
-		"text":                     sb.String(),
-		"parse_mode":               "HTML",
-		"disable_web_page_preview": true,
-	}
-	body, _ := json.Marshal(payload)
-	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", tg.Token)
-	http.Post(apiURL, "application/json", bytes.NewReader(body))
 }
 
 func escapeHTML(s string) string {
@@ -278,6 +432,12 @@ var (
 	processedTargets  int64
 	vulnerableTargets int64
 	vulnerableMap     sync.Map
+
+	// Regexes
+	reX9       = regexp.MustCompile(`x9(?:canary)?[a-z]*`)
+	rePayload  = regexp.MustCompile(`\[(?:"([^"]+)"|([^"\]]+))\]$`)
+	reANSI     = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+	reCleaning = regexp.MustCompile(`\s*\["0m"\]\s*`)
 )
 
 func logLine(level, color, format string, args ...interface{}) {
@@ -286,8 +446,7 @@ func logLine(level, color, format string, args ...interface{}) {
 }
 
 func stripANSI(str string) string {
-	re := regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
-	return re.ReplaceAllString(str, "")
+	return reANSI.ReplaceAllString(str, "")
 }
 
 func runCommand(name string, args ...string) (string, error) {
@@ -327,6 +486,8 @@ func processURL(targetURL string, index, total int) {
 
 	logLine("TARGET", X_white, "[%d/%d | Vulns: %d] %s", currProcessed, total, currVulns, targetURL)
 	safe := regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(targetURL, "_")
+
+	report := VulnerabilityReport{URL: targetURL}
 
 	// Phase 2: Canary Probe
 	logLine("PHASE", X_cyan, "2/5 Canary Probing...")
@@ -389,14 +550,15 @@ func processURL(targetURL string, index, total int) {
 		finalX9Base := filepath.Join(outputDir, safe+"-final-http")
 		runCommand("./x9", "-i", atkIn, "-json", "-headers", "-o", finalX9Base)
 
-		finalFiles := []string{finalX9Base + ".get", finalX9Base + ".json", finalX9Base + ".header"}
-		for _, ff := range finalFiles {
+		finalFiles := map[string]string{
+			finalX9Base + ".get":    "get",
+			finalX9Base + ".json":   "json",
+			finalX9Base + ".header": "header",
+		}
+		for ff, phase := range finalFiles {
 			if _, err := os.Stat(ff); err == nil {
 				if findings, _ := runCommand("nuclei", "-l", ff, "-t", nucleiTemplate, "-silent"); findings != "" {
-					lines := strings.Split(strings.TrimSpace(findings), "\n")
-					uniqueFindings := dedupeNucleiFindings(lines)
-					logLine("VULN", X_red, "Found %d Reflections in %s!", len(uniqueFindings), ff)
-					tg.notify(targetURL, uniqueFindings, "Reflection")
+					report.aggregateFindings(findings, phase)
 				}
 			}
 		}
@@ -414,12 +576,13 @@ func processURL(targetURL string, index, total int) {
 		if _, err := os.Stat(ff); err == nil {
 			// Added timeout to headless scan
 			if dom, _ := runCommand("nuclei", "-l", ff, "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
-				lines := strings.Split(strings.TrimSpace(dom), "\n")
-				uniqueFindings := dedupeNucleiFindings(lines)
-				logLine("VULN", X_red, "Found %d DOM XSS!", len(uniqueFindings))
-				tg.notify(targetURL, uniqueFindings, "DOM")
+				report.aggregateFindings(dom, "dom")
 			}
 		}
+	}
+
+	if report.HasVulns() {
+		tg.notify(report)
 	}
 }
 
@@ -513,10 +676,11 @@ func main() {
 	uniqueCrawled := uniqueStrings(allCrawledURLs)
 	os.WriteFile(finalIn, []byte(strings.Join(uniqueCrawled, "\n")), 0644)
 	if so, _ := runCommand("nuclei", "-l", finalIn, "-t", nucleiTemplate, "-silent"); so != "" {
-		lines := strings.Split(strings.TrimSpace(so), "\n")
-		uniqueFindings := dedupeNucleiFindings(lines)
-		logLine("VULN", X_red, "Found %d Second-Order XSS vulnerabilities!", len(uniqueFindings))
-		tg.notify("Global Second-Order Check", uniqueFindings, "Second-Order")
+		soReport := VulnerabilityReport{URL: "Global Second-Order Check"}
+		soReport.aggregateFindings(so, "get")
+		if soReport.HasVulns() {
+			tg.notify(soReport)
+		}
 	}
 
 	fmt.Printf("\n%s[DONE]%s Full Recon & XSS Pipeline Complete.\n", X_green, X_reset)
