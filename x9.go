@@ -1,3 +1,6 @@
+// FILE: x9.go — MODIFIED
+// Changes: Add -dom flag to support fragment-injected canary and attack payloads.
+
 package main
 
 import (
@@ -165,6 +168,7 @@ func main() {
 		probeMode  bool
 		jsonMode   bool
 		headerMode bool
+		domMode    bool
 	)
 
 	flag.StringVar(&inputFile, "i", "", "File containing URLs")
@@ -174,6 +178,7 @@ func main() {
 	flag.BoolVar(&probeMode, "probe", false, "Enable canary probe mode")
 	flag.BoolVar(&jsonMode, "json", false, "Enable JSON body generation")
 	flag.BoolVar(&headerMode, "headers", false, "Enable Header injection mode")
+	flag.BoolVar(&domMode, "dom", false, "Enable DOM fragment injection mode")
 	flag.Parse()
 
 	if inputFile == "" && singleURL == "" {
@@ -201,7 +206,7 @@ func main() {
 	fGet, _ := os.Create(outputBase + ".get")
 	defer fGet.Close()
 
-	var fJson, fHeader *os.File
+	var fJson, fHeader, fDomCanary, fDomAttack *os.File
 	if jsonMode {
 		fJson, _ = os.Create(outputBase + ".json")
 		defer fJson.Close()
@@ -209,6 +214,12 @@ func main() {
 	if headerMode {
 		fHeader, _ = os.Create(outputBase + ".header")
 		defer fHeader.Close()
+	}
+	if domMode {
+		fDomCanary, _ = os.Create(outputBase + ".dom.canary")
+		defer fDomCanary.Close()
+		fDomAttack, _ = os.Create(outputBase + ".dom.attack")
+		defer fDomAttack.Close()
 	}
 
 	for _, raw := range rawURLs {
@@ -252,6 +263,22 @@ func main() {
 			if headerMode && fHeader != nil {
 				for _, h := range targetHeaders {
 					fmt.Fprintf(fHeader, "%s|%s:%s\n", raw, h, payload)
+				}
+			}
+
+			// 4. DOM Fragment Injection Mode
+			if domMode {
+				tempBase := *base
+				tempBase.Fragment = payload
+				urlWithFragment := buildURL(&tempBase, base.Params)
+				if probeMode {
+					if fDomCanary != nil {
+						fmt.Fprintln(fDomCanary, urlWithFragment)
+					}
+				} else {
+					if fDomAttack != nil {
+						fmt.Fprintln(fDomAttack, urlWithFragment)
+					}
 				}
 			}
 		}

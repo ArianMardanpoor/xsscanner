@@ -4,7 +4,7 @@ info:
   name: DOM Canary Reflection Detection (Headless)
   author: jules
   severity: info
-  description: Detects simple canary reflection in DOM to identify potentially vulnerable parameters for DOM XSS.
+  description: Detects simple canary reflection in DOM sinks to identify potentially vulnerable parameters for DOM XSS.
   tags: headless, dom, canary
 
 headless:
@@ -13,16 +13,70 @@ headless:
         args:
           url: "{{BaseURL}}"
 
+      - action: script
+        args:
+          code: |
+            (function() {
+              window.capturedSinks = window.capturedSinks || [];
+              const canaryPattern = /x9canary[a-z]{3}/;
+
+              function track(sinkName, value) {
+                if (canaryPattern.test(String(value))) {
+                  window.capturedSinks.push(sinkName);
+                }
+              }
+
+              // Hook Functions
+              const originalEval = window.eval;
+              window.eval = function(code) { track('eval', code); return originalEval.apply(this, arguments); };
+
+              const originalSetTimeout = window.setTimeout;
+              window.setTimeout = function(func, delay) { track('setTimeout', func); return originalSetTimeout.apply(this, arguments); };
+
+              const originalSetInterval = window.setInterval;
+              window.setInterval = function(func, delay) { track('setInterval', func); return originalSetInterval.apply(this, arguments); };
+
+              const originalWrite = document.write;
+              document.write = function(content) { track('document.write', content); return originalWrite.apply(document, arguments); };
+
+              const originalWriteln = document.writeln;
+              document.writeln = function(content) { track('document.writeln', content); return originalWriteln.apply(document, arguments); };
+
+              // Hook Setters
+              const hookSetter = (proto, prop) => {
+                const descriptor = Object.getOwnPropertyDescriptor(proto, prop);
+                if (descriptor && descriptor.set) {
+                  Object.defineProperty(proto, prop, {
+                    set: function(val) {
+                      track(prop, val);
+                      return descriptor.set.apply(this, arguments);
+                    },
+                    get: function() { return descriptor.get.apply(this); },
+                    configurable: true
+                  });
+                }
+              };
+
+              hookSetter(Element.prototype, 'innerHTML');
+              hookSetter(Element.prototype, 'outerHTML');
+              hookSetter(HTMLImageElement.prototype, 'src');
+              hookSetter(HTMLScriptElement.prototype, 'src');
+              hookSetter(HTMLIFrameElement.prototype, 'src');
+              hookSetter(HTMLAnchorElement.prototype, 'href');
+            })();
+
       - action: waitload
 
       - action: script
         args:
           code: |
             (function() {
-              const pattern = /x9canary[a-z]{3}/;
-              const content = document.documentElement.outerHTML;
-              if (pattern.test(content)) return "Found Canary in DOM";
-              return "";
+              const canaryPattern = /x9canary[a-z]{3}/;
+              if (canaryPattern.test(document.documentElement.innerHTML)) {
+                window.capturedSinks.push("innerHTML_static");
+              }
+              // Return unique sinks
+              return [...new Set(window.capturedSinks)].join(",");
             })()
         name: dom_canary_reflection
 
@@ -30,10 +84,17 @@ headless:
       - type: word
         part: dom_canary_reflection
         words:
-          - "Found Canary in DOM"
+          - "innerHTML"
+          - "outerHTML"
+          - "eval"
+          - "setTimeout"
+          - "setInterval"
+          - "document.write"
+          - "src"
+          - "href"
 
     extractors:
       - type: regex
         part: dom_canary_reflection
         regex:
-          - "Found Canary in DOM"
+          - "[a-zA-Z0-9_]+"
