@@ -118,6 +118,7 @@ var (
 	nucleiTemplate string
 	domTemplate    string
 	canaryTemplate string
+	paramFile      string
 	concurrency    int
 	workers        int
 	mu             sync.Mutex
@@ -144,17 +145,19 @@ func runCommand(name string, args ...string) (string, error) {
 }
 
 func extractURLsFromNuclei(nucleiOutput string) []string {
-	// Nuclei output typically contains [template-id] [protocol] [severity] URL
-	// We want to extract the URL part.
+	// Nuclei output typically contains [template-id] [protocol] [severity] URL [extractors]
+	// We want to find the part that starts with http.
 	var urls []string
 	scanner := bufio.NewScanner(strings.NewReader(nucleiOutput))
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.Fields(line)
-		if len(parts) > 0 {
-			lastPart := parts[len(parts)-1]
-			if strings.HasPrefix(lastPart, "http") {
-				urls = append(urls, lastPart)
+		for _, part := range parts {
+			if strings.HasPrefix(part, "http://") || strings.HasPrefix(part, "https://") {
+				// Remove trailing brackets if any (sometimes nuclei wraps things)
+				urlPart := strings.Trim(part, "[]")
+				urls = append(urls, urlPart)
+				break
 			}
 		}
 	}
@@ -175,7 +178,13 @@ func processURL(targetURL string, index, total int) {
 	}
 
 	probeOutputBase := filepath.Join(outputDir, safe+"-probe-out")
-	if _, err := runCommand("./x9", "-probe", "-json", "-headers", "-i", probeInput, "-o", probeOutputBase); err != nil {
+	x9Args := []string{"-probe", "-json", "-headers", "-i", probeInput, "-o", probeOutputBase}
+	if paramFile != "" {
+		if _, err := os.Stat(paramFile); err == nil {
+			x9Args = append(x9Args, "-p", paramFile)
+		}
+	}
+	if _, err := runCommand("./x9", x9Args...); err != nil {
 		logLine("ERROR", X_red, "x9 probe failed: %v", err)
 	}
 
@@ -234,6 +243,7 @@ func main() {
 	flag.StringVar(&nucleiTemplate, "t", "xss_template_v2.yaml", "Reflection template")
 	flag.StringVar(&domTemplate, "dom", "dom_xss.yaml", "DOM template")
 	flag.StringVar(&canaryTemplate, "canary", "canary_matcher.yaml", "Canary template")
+	flag.StringVar(&paramFile, "p", "", "Parameter file to use with x9")
 	flag.IntVar(&concurrency, "c", 10, "x9 concurrency per URL")
 	flag.IntVar(&workers, "w", 3, "Parallel URL workers")
 	flag.Parse()

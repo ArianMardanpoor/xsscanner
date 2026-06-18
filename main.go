@@ -195,6 +195,7 @@ func processTarget(target string, mode string) {
 	logMsg(fmt.Sprintf("Launching XSSniper for %s", target), M_cyan)
 
 	jobFile := filepath.Join(globalOutputDir, fmt.Sprintf("job_%s.txt", safeURL+"_"+time.Now().Format("20060102150405")))
+	paramFilePath := filepath.Join(paramsDir, hostname+"-param.txt")
 
 	f, err := os.Create(jobFile)
 	if err == nil {
@@ -217,11 +218,11 @@ func processTarget(target string, mode string) {
 
 		appendSafe(filepath.Join(passiveDir, hostname+".passive"))
 		appendSafe(filepath.Join(katanaDir, safeURL+"-katana.txt"))
-		appendSafe(filepath.Join(paramsDir, hostname+"-param.txt"))
+		// We no longer append raw params to job file. They are passed via -p flag.
 	}
 
 	// Run xssniper
-	runBinary("./xssniper", "-l", jobFile, "-w", "3")
+	runBinary("./xssniper", "-l", jobFile, "-p", paramFilePath, "-w", "3")
 
 	// Even in fresh mode we should probably mark as scanned if we want to avoid double scan in SAME run
 	// but the requirement said fresh mode scans everything.
