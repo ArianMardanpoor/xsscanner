@@ -182,15 +182,16 @@ func dedupeNucleiFindings(findings string) []string {
 	seen := make(map[string]bool)
 	var result []string
 
+	// Improved regex to match both probe and heavy payloads
+	re := regexp.MustCompile(`x9(?:canary)?[a-z]{3}['\"` + "`" + `\\;<{]*`)
+
 	for _, line := range lines {
 		if line == "" {
 			continue
 		}
 		// Try to create a unique key: template-id + simplified URL
-		// We remove the specific x9 payload from the URL to deduplicate repeated attacks on same param
 		parts := strings.Fields(line)
-		if len(parts) < 4 {
-			result = append(result, line)
+		if len(parts) < 1 {
 			continue
 		}
 
@@ -203,8 +204,12 @@ func dedupeNucleiFindings(findings string) []string {
 			}
 		}
 
+		if targetURL == "" {
+			result = append(result, line)
+			continue
+		}
+
 		// Simplify URL by replacing x9 payload values with a placeholder
-		re := regexp.MustCompile(`x9[a-z]{3}['\"` + "`" + `\\;<{]*`)
 		simpleURL := re.ReplaceAllString(targetURL, "REDACTED")
 
 		key := templateID + "|" + simpleURL
@@ -214,6 +219,37 @@ func dedupeNucleiFindings(findings string) []string {
 		}
 	}
 	return result
+}
+
+func filterFileForNuclei(inputPath string) string {
+	file, err := os.Open(inputPath)
+	if err != nil {
+		return inputPath
+	}
+	defer file.Close()
+
+	seen := make(map[string]bool)
+	var uniqueLines []string
+	re := regexp.MustCompile(`x9(?:canary)?[a-z]{3}['\"` + "`" + `\\;<{]*`)
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Create a key based on the URL structure, not the specific payload
+		key := re.ReplaceAllString(line, "REDACTED")
+		if !seen[key] {
+			seen[key] = true
+			uniqueLines = append(uniqueLines, line)
+		}
+	}
+
+	if len(uniqueLines) == 0 {
+		return inputPath
+	}
+
+	outputPath := inputPath + ".dedupe"
+	os.WriteFile(outputPath, []byte(strings.Join(uniqueLines, "\n")+"\n"), 0644)
+	return outputPath
 }
 
 // ── Core Logic ────────────────────────────────────────────────────────────────
@@ -272,8 +308,11 @@ func processURL(targetURL string, index, total int) {
 	finalFiles := []string{finalX9Base + ".get", finalX9Base + ".json", finalX9Base + ".header"}
 	for _, ff := range finalFiles {
 		if _, err := os.Stat(ff); err == nil {
+			// Deduplicate the input file to speed up Nuclei and reduce redundant requests
+			dedupedFile := filterFileForNuclei(ff)
+
 			// Reflection Scan
-			if findings, _ := runCommand("nuclei", "-l", ff, "-t", nucleiTemplate, "-silent"); findings != "" {
+			if findings, _ := runCommand("nuclei", "-l", dedupedFile, "-t", nucleiTemplate, "-silent"); findings != "" {
 				uniqueFindings := dedupeNucleiFindings(findings)
 				logLine("VULN", X_red, "Found %d Unique Reflections in %s! (Original: %d)", len(uniqueFindings), ff, len(strings.Split(strings.TrimSpace(findings), "\n")))
 				tg.notify(targetURL, uniqueFindings, "Reflection")
@@ -281,7 +320,7 @@ func processURL(targetURL string, index, total int) {
 
 			// DOM Scan (only makes sense for GET/URLs usually, but we try anyway or filter)
 			if strings.HasSuffix(ff, ".get") {
-				if dom, _ := runCommand("nuclei", "-l", ff, "-t", domTemplate, "-headless", "-silent"); dom != "" {
+				if dom, _ := runCommand("nuclei", "-l", dedupedFile, "-t", domTemplate, "-headless", "-silent"); dom != "" {
 					uniqueDOM := dedupeNucleiFindings(dom)
 					logLine("VULN", X_red, "Found %d Unique DOM XSS! (Original: %d)", len(uniqueDOM), len(strings.Split(strings.TrimSpace(dom), "\n")))
 					tg.notify(targetURL, uniqueDOM, "DOM")
