@@ -1,5 +1,5 @@
 // FILE: xssniper.go — MODIFIED
-// Changes: Implement verifyReflection, severity triage, Task 4b confirmation (GET/JSON/Header), improved terminal output, and bug fixes.
+// Changes: Fix duplicate processing, improve payload capture, add URL filtering, and ensure DOM scan reliability.
 
 package main
 
@@ -68,7 +68,7 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 			continue
 		}
 
-		// 1. Extract redacted payload
+		// 1. Extract payload
 		payload := ""
 		if m := rePayload.FindStringSubmatch(line); len(m) > 0 {
 			if m[1] != "" {
@@ -76,9 +76,6 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 			} else {
 				payload = m[2]
 			}
-		}
-		if payload != "" {
-			payload = redactX9(payload)
 		}
 
 		// 2. Extract URL and injection point
@@ -130,10 +127,15 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 		case "dom":
 			targetList = &r.DOM
 			if u, err := url.Parse(decodedURL); err == nil {
-				for k, v := range u.Query() {
-					if strings.Contains(redactX9(strings.Join(v, "")), "x9") {
-						name = k
-						break
+				// Check fragment first
+				if strings.Contains(redactX9(u.Fragment), "x9") {
+					name = "fragment"
+				} else {
+					for k, v := range u.Query() {
+						if strings.Contains(redactX9(strings.Join(v, "")), "x9") {
+							name = k
+							break
+						}
 					}
 				}
 			}
@@ -152,7 +154,6 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 		found:
 		}
 
-		// Task 2: Skip unknown and misidentified headers
 		if name == "unknown" {
 			continue
 		}
@@ -160,7 +161,6 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 			continue
 		}
 
-		// Task 1: Verify reflection for non-GET/DOM findings
 		severity := "possible"
 		if phase == "get" || phase == "dom" {
 			severity = "likely"
@@ -183,12 +183,11 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 				if verifyReflection(targetURL, method, headers, body, canary) {
 					severity = "likely"
 				} else {
-					continue // Discard if not verified
+					continue
 				}
 			}
 		}
 
-		// Update or Add
 		found := false
 		for i, v := range *targetList {
 			if v.Name == name {
@@ -223,14 +222,10 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 
 func severityWeight(s string) int {
 	switch s {
-	case "confirmed":
-		return 3
-	case "likely":
-		return 2
-	case "possible":
-		return 1
-	default:
-		return 0
+	case "confirmed": return 3
+	case "likely": return 2
+	case "possible": return 1
+	default: return 0
 	}
 }
 
@@ -241,24 +236,16 @@ func verifyReflection(targetURL, method string, headers map[string]string, body,
 
 	if method == "POST" {
 		req, err = http.NewRequest("POST", targetURL, strings.NewReader(body))
-		if err == nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
+		if err == nil { req.Header.Set("Content-Type", "application/json") }
 	} else {
 		req, err = http.NewRequest("GET", targetURL, nil)
 	}
 
-	if err != nil {
-		return false
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
+	if err != nil { return false }
+	for k, v := range headers { req.Header.Set(k, v) }
 
 	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
+	if err != nil { return false }
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
@@ -272,22 +259,16 @@ func loadEnv() {
 	}
 	for _, path := range candidates {
 		f, err := os.Open(path)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 		sc := bufio.NewScanner(f)
 		for sc.Scan() {
 			line := strings.TrimSpace(sc.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
+			if line == "" || strings.HasPrefix(line, "#") { continue }
 			parts := strings.SplitN(line, "=", 2)
 			if len(parts) == 2 {
 				key := strings.TrimSpace(parts[0])
 				val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
-				if os.Getenv(key) == "" {
-					os.Setenv(key, val)
-				}
+				if os.Getenv(key) == "" { os.Setenv(key, val) }
 			}
 		}
 		f.Close()
@@ -297,28 +278,21 @@ func loadEnv() {
 func newTelegram() *Telegram {
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	chatID := os.Getenv("TELEGRAM_CHAT_ID")
-	if token == "" || chatID == "" {
-		return nil
-	}
+	if token == "" || chatID == "" { return nil }
 	return &Telegram{Token: token, ChatID: chatID}
 }
 
 func dedupeNucleiFindings(report VulnerabilityReport) string {
 	var sb strings.Builder
 	renderSection := func(title string, vulns []Vulnerability) {
-		if len(vulns) == 0 {
-			return
-		}
+		if len(vulns) == 0 { return }
 		sb.WriteString(fmt.Sprintf("\n  %s[%s]%s\n", X_cyan, title, X_reset))
 		for _, v := range vulns {
 			sevColor := X_gray
 			switch v.Severity {
-			case "confirmed":
-				sevColor = X_red + X_bold
-			case "likely":
-				sevColor = X_yellow
-			case "possible":
-				sevColor = X_white
+			case "confirmed": sevColor = X_red + X_bold
+			case "likely": sevColor = X_yellow
+			case "possible": sevColor = X_white
 			}
 			sb.WriteString(fmt.Sprintf("    - %s: %s [%s]%s\n", v.Name, sevColor, v.Severity, X_reset))
 			if len(v.Payloads) > 0 {
@@ -349,9 +323,8 @@ func dedupeConfirmedURLs(urls []string) []string {
 				newQuery.Set(k, val)
 			}
 			uParsed.RawQuery = newQuery.Encode()
-			if uParsed.Path == "/" {
-				uParsed.Path = ""
-			}
+			uParsed.Fragment = redactX9(uParsed.Fragment)
+			if uParsed.Path == "/" { uParsed.Path = "" }
 			normalized = uParsed.String()
 		} else {
 			normalized = redactX9(u)
@@ -366,9 +339,7 @@ func dedupeConfirmedURLs(urls []string) []string {
 }
 
 func (tg *Telegram) notify(report VulnerabilityReport) {
-	if !report.HasVulns() {
-		return
-	}
+	if !report.HasVulns() { return }
 
 	if _, loaded := vulnerableMap.LoadOrStore(report.URL, true); !loaded {
 		atomic.AddInt64(&vulnerableTargets, 1)
@@ -396,9 +367,7 @@ func (tg *Telegram) notify(report VulnerabilityReport) {
 				break
 			}
 		}
-		if hasHighSeverity {
-			break
-		}
+		if hasHighSeverity { break }
 	}
 
 	if tg != nil && hasHighSeverity {
@@ -457,6 +426,7 @@ var (
 	processedTargets  int64
 	vulnerableTargets int64
 	vulnerableMap     sync.Map
+	workerLock        sync.Map
 	nucleiExists      bool
 
 	reX9       = regexp.MustCompile(`x9(?:canary)?[a-z]*`)
@@ -475,9 +445,7 @@ func stripANSI(str string) string {
 }
 
 func runCommand(name string, args ...string) (string, error) {
-	if name == "nuclei" && !nucleiExists {
-		return "", nil
-	}
+	if name == "nuclei" && !nucleiExists { return "", nil }
 	cmd := exec.Command(name, args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -504,7 +472,7 @@ func extractURLsFromNuclei(nucleiOutput string) []string {
 
 // ── Core Logic ────────────────────────────────────────────────────────────────
 
-func confirmParameter(targetURL, phase, name string) bool {
+func confirmParameter(targetURL, phase, name string) (bool, string) {
 	payloads := []string{
 		`"><img src=x onerror=prompt(document.domain)>`,
 		`" onmouseover=prompt(document.domain) x="`,
@@ -520,9 +488,7 @@ func confirmParameter(targetURL, phase, name string) bool {
 		finalURL := targetURL
 
 		u, err := url.Parse(targetURL)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 
 		switch phase {
 		case "get":
@@ -534,16 +500,17 @@ func confirmParameter(targetURL, phase, name string) bool {
 			headers[name] = p
 		case "json":
 			method = "POST"
-			data := map[string]string{name: p}
+			data := make(map[string]interface{})
+			// If we could parse original body, we'd preserve it.
+			// For now, we use a simple object as Task 4 asks for unencoded check.
+			data[name] = p
 			b, _ := json.Marshal(data)
 			body = string(b)
 		}
 
-		if reflectionExists(finalURL, method, headers, body, p) {
-			return true
-		}
+		if reflectionExists(finalURL, method, headers, body, p) { return true, p }
 	}
-	return false
+	return false, ""
 }
 
 func reflectionExists(targetURL, method string, headers map[string]string, body, payload string) bool {
@@ -555,20 +522,18 @@ func reflectionExists(targetURL, method string, headers map[string]string, body,
 	} else {
 		req, _ = http.NewRequest("GET", targetURL, nil)
 	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
+	for k, v := range headers { req.Header.Set(k, v) }
 
 	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
+	if err != nil { return false }
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return strings.Contains(string(b), payload)
 }
 
 func processURL(targetURL string, index, total int) {
+	if _, loaded := workerLock.LoadOrStore(targetURL, true); loaded { return }
+
 	atomic.AddInt64(&processedTargets, 1)
 	currProcessed := atomic.LoadInt64(&processedTargets)
 	currVulns := atomic.LoadInt64(&vulnerableTargets)
@@ -616,45 +581,34 @@ func processURL(targetURL string, index, total int) {
 
 	// Phase 4b: Confirmation Triage
 	logLine("PHASE", X_yellow, "4b/5 Triage & Context Confirmation...")
-	confirmedParams := make(map[string]map[string]bool) // phase -> param -> bool
-	for p := range p3Findings {
-		confirmedParams[p] = make(map[string]bool)
-	}
+	confirmedParams := make(map[string]map[string]bool)
+	for p := range p3Findings { confirmedParams[p] = make(map[string]bool) }
 
 	for phase, urls := range p3Findings {
-		if phase == "dom" {
-			continue
-		}
+		if phase == "dom" { continue }
 		tempRep := VulnerabilityReport{URL: targetURL}
 		dummy := ""
-		for _, u := range urls {
-			dummy += "[canary] [info] " + u + " [x9canary]\n"
-		}
+		for _, u := range urls { dummy += "[canary] [info] " + u + " [x9canary]\n" }
 		tempRep.aggregateFindings(dummy, phase)
 
 		var vList *[]Vulnerability
 		switch phase {
-		case "get":
-			vList = &tempRep.QueryParameters
-		case "header":
-			vList = &tempRep.Headers
-		case "json":
-			vList = &tempRep.JSONBody
+		case "get": vList = &tempRep.QueryParameters
+		case "header": vList = &tempRep.Headers
+		case "json": vList = &tempRep.JSONBody
 		}
 
 		if vList != nil {
 			for _, v := range *vList {
-				if confirmParameter(targetURL, phase, v.Name) {
+				if ok, p := confirmParameter(targetURL, phase, v.Name); ok {
 					v.Confirmed = true
 					v.Severity = "confirmed"
+					v.Payloads = []string{p}
 					confirmedParams[phase][v.Name] = true
 					switch phase {
-					case "get":
-						report.QueryParameters = append(report.QueryParameters, v)
-					case "header":
-						report.Headers = append(report.Headers, v)
-					case "json":
-						report.JSONBody = append(report.JSONBody, v)
+					case "get": report.QueryParameters = append(report.QueryParameters, v)
+					case "header": report.Headers = append(report.Headers, v)
+					case "json": report.JSONBody = append(report.JSONBody, v)
 					}
 					logLine("CONFIRM", X_green, "Confirmed XSS (%s): %s (param: %s)", phase, targetURL, v.Name)
 				}
@@ -667,22 +621,17 @@ func processURL(targetURL string, index, total int) {
 
 	httpAtkUrls := []string{}
 	for phase, urls := range p3Findings {
-		if phase == "dom" {
-			continue
-		}
+		if phase == "dom" { continue }
 		for _, u := range urls {
 			uDecoded, _ := url.QueryUnescape(u)
 			isConfirmed := false
-			// Simple check: if any confirmed param name for this phase is in the URL/injection
 			for name := range confirmedParams[phase] {
 				if strings.Contains(uDecoded, name+"=") || strings.Contains(uDecoded, name+":") || strings.Contains(uDecoded, "\""+name+"\"") {
 					isConfirmed = true
 					break
 				}
 			}
-			if !isConfirmed {
-				httpAtkUrls = append(httpAtkUrls, u)
-			}
+			if !isConfirmed { httpAtkUrls = append(httpAtkUrls, u) }
 		}
 	}
 
@@ -711,9 +660,7 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 
-	if report.HasVulns() {
-		tg.notify(report)
-	}
+	if report.HasVulns() { tg.notify(report) }
 }
 
 func uniqueStrings(slice []string) []string {
@@ -722,26 +669,19 @@ func uniqueStrings(slice []string) []string {
 	for _, entry := range slice {
 		u, err := url.Parse(entry)
 		if err != nil {
-			if !keys[entry] {
-				keys[entry] = true
-				list = append(list, entry)
-			}
+			if !keys[entry] { keys[entry] = true; list = append(list, entry) }
 			continue
 		}
-		if u.Path == "/" {
-			u.Path = ""
-		}
+		if u.Path == "/" { u.Path = "" }
 		normalized := u.String()
-		if !keys[normalized] {
-			keys[normalized] = true
-			list = append(list, entry)
-		}
+		if !keys[normalized] { keys[normalized] = true; list = append(list, entry) }
 	}
 	return list
 }
 
 func main() {
 	urlFile := flag.String("l", "", "URL list file")
+	singleURL := flag.String("u", "", "Single target URL")
 	flag.StringVar(&outputDir, "o", "./output", "Output directory")
 	flag.StringVar(&nucleiTemplate, "t", "xss_template_v2.yaml", "Reflection template")
 	flag.StringVar(&domTemplate, "dom", "dom_xss.yaml", "DOM template")
@@ -762,25 +702,46 @@ func main() {
 	os.MkdirAll(outputDir, 0755)
 
 	var urls []string
-	var scanner *bufio.Scanner
+	if *singleURL != "" {
+		urls = append(urls, *singleURL)
+	}
+
 	if *urlFile == "-" {
-		scanner = bufio.NewScanner(os.Stdin)
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			if u := strings.TrimSpace(scanner.Text()); u != "" { urls = append(urls, u) }
+		}
 	} else if *urlFile != "" {
 		file, _ := os.Open(*urlFile)
-		defer file.Close()
-		scanner = bufio.NewScanner(file)
-	} else {
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			if u := strings.TrimSpace(scanner.Text()); u != "" { urls = append(urls, u) }
+		}
+		file.Close()
+	}
+
+	if len(urls) == 0 {
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	for scanner.Scan() {
-		if u := strings.TrimSpace(scanner.Text()); u != "" {
-			urls = append(urls, u)
+	urls = uniqueStrings(urls)
+
+	// Issue 4: Filter out localhost and non-matching hosts in single-target mode
+	if *singleURL != "" {
+		uTarget, _ := url.Parse(*singleURL)
+		if uTarget != nil {
+			var filtered []string
+			for _, u := range urls {
+				parsed, err := url.Parse(u)
+				if err == nil && parsed.Host == uTarget.Host {
+					filtered = append(filtered, u)
+				}
+			}
+			urls = filtered
 		}
 	}
 
-	urls = uniqueStrings(urls)
 	allCrawledURLs = append(allCrawledURLs, urls...)
 
 	sem := make(chan struct{}, workers)
@@ -802,9 +763,7 @@ func main() {
 	if so, _ := runCommand("nuclei", "-l", finalIn, "-t", nucleiTemplate, "-silent"); so != "" {
 		soReport := VulnerabilityReport{URL: "Global Second-Order Check"}
 		soReport.aggregateFindings(so, "get")
-		if soReport.HasVulns() {
-			tg.notify(soReport)
-		}
+		if soReport.HasVulns() { tg.notify(soReport) }
 	}
 	fmt.Printf("\n%s[DONE]%s Pipeline Complete.\n", X_green, X_reset)
 }
