@@ -1,5 +1,5 @@
 // FILE: x9.go — MODIFIED
-// Changes: Add -dom flag to support fragment-injected canary and attack payloads.
+// Changes: Bug 2: Add 'message' and 'template' to defaultParams. Align break payloads with Bug 1 requirements. Ensure fragment injection preserves query parameters.
 
 package main
 
@@ -36,6 +36,7 @@ var defaultParams = []string{
 	"debug", "test", "redirect", "src", "source", "file", "path",
 	"next", "return", "return_url", "returnUrl", "continue", "to", "goto", "callback",
 	"checkout_url", "dest", "destination", "redir", "out", "view", "from_url",
+	"message", "template",
 }
 
 var targetHeaders = []string{
@@ -64,7 +65,6 @@ func getBreakPayloads() []string {
 		prefix + "'",
 		prefix + "\"",
 		prefix + "`",
-		prefix + "\\'",
 		prefix + "<",
 		prefix + ";",
 		prefix + "{{",
@@ -127,9 +127,6 @@ func getAllParams(originalParams map[string]string, paramFile string, probeMode 
 		allParamsMap[k] = true
 	}
 
-	// Only add default params if we are in probe mode OR if we have NO parameters yet.
-	// If we are in attack mode and already have parameters (from canary phase),
-	// we only want to attack those specific parameters.
 	if probeMode || len(allParamsMap) == 0 {
 		for _, p := range defaultParams {
 			allParamsMap[p] = true
@@ -158,8 +155,6 @@ func getAllParams(originalParams map[string]string, paramFile string, probeMode 
 }
 
 func main() {
-	// No need for rand.Seed(time.Now().UnixNano()) in Go 1.20+
-
 	var (
 		inputFile  string
 		paramFile  string
@@ -230,7 +225,6 @@ func main() {
 
 		var payloads []string
 		if probeMode {
-			// For probe, we use a single canary, but we will test it against each parameter individually if needed
 			payloads = []string{"x9canary" + randomString(3)}
 		} else {
 			payloads = getBreakPayloads()
@@ -270,6 +264,7 @@ func main() {
 			if domMode {
 				tempBase := *base
 				tempBase.Fragment = payload
+				// buildURL correctly preserves all parameters from base.Params
 				urlWithFragment := buildURL(&tempBase, base.Params)
 				if probeMode {
 					if fDomCanary != nil {
