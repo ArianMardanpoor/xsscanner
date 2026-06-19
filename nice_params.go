@@ -130,6 +130,19 @@ func cleanParam(p string) string {
 	p = strings.TrimSpace(p)
 	return p
 }
+func isValidParam(p string) bool {
+	// پارامتر نباید فقط عدد باشد
+	if regexp.MustCompile(`^\d+$`).MatchString(p) {
+		return false
+	}
+	// پارامتر نباید خیلی کوتاه یا خیلی بلند باشد
+	if len(p) < 2 || len(p) > 50 {
+		return false
+	}
+	// پارامتر نباید شامل حروف بزرگ باشد (نام متغیر JS)
+	// اختیاری - بستگی به target دارد
+	return true
+}
 
 func readParams(filename string) ([]string, error) {
 	content, err := os.ReadFile(filename)

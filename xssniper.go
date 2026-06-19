@@ -223,10 +223,14 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 
 func severityWeight(s string) int {
 	switch s {
-	case "confirmed": return 3
-	case "likely": return 2
-	case "possible": return 1
-	default: return 0
+	case "confirmed":
+		return 3
+	case "likely":
+		return 2
+	case "possible":
+		return 1
+	default:
+		return 0
 	}
 }
 
@@ -237,16 +241,24 @@ func verifyReflection(targetURL, method string, headers map[string]string, body,
 
 	if method == "POST" {
 		req, err = http.NewRequest("POST", targetURL, strings.NewReader(body))
-		if err == nil { req.Header.Set("Content-Type", "application/json") }
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
 	} else {
 		req, err = http.NewRequest("GET", targetURL, nil)
 	}
 
-	if err != nil { return false }
-	for k, v := range headers { req.Header.Set(k, v) }
+	if err != nil {
+		return false
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := client.Do(req)
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
@@ -260,16 +272,22 @@ func loadEnv() {
 	}
 	for _, path := range candidates {
 		f, err := os.Open(path)
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		sc := bufio.NewScanner(f)
 		for sc.Scan() {
 			line := strings.TrimSpace(sc.Text())
-			if line == "" || strings.HasPrefix(line, "#") { continue }
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
 			parts := strings.SplitN(line, "=", 2)
 			if len(parts) == 2 {
 				key := strings.TrimSpace(parts[0])
 				val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
-				if os.Getenv(key) == "" { os.Setenv(key, val) }
+				if os.Getenv(key) == "" {
+					os.Setenv(key, val)
+				}
 			}
 		}
 		f.Close()
@@ -279,21 +297,28 @@ func loadEnv() {
 func newTelegram() *Telegram {
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
 	chatID := os.Getenv("TELEGRAM_CHAT_ID")
-	if token == "" || chatID == "" { return nil }
+	if token == "" || chatID == "" {
+		return nil
+	}
 	return &Telegram{Token: token, ChatID: chatID}
 }
 
 func dedupeNucleiFindings(report VulnerabilityReport) string {
 	var sb strings.Builder
 	renderSection := func(title string, vulns []Vulnerability) {
-		if len(vulns) == 0 { return }
+		if len(vulns) == 0 {
+			return
+		}
 		sb.WriteString(fmt.Sprintf("\n  %s[%s]%s\n", X_cyan, title, X_reset))
 		for _, v := range vulns {
 			sevColor := X_gray
 			switch v.Severity {
-			case "confirmed": sevColor = X_red + X_bold
-			case "likely": sevColor = X_yellow
-			case "possible": sevColor = X_white
+			case "confirmed":
+				sevColor = X_red + X_bold
+			case "likely":
+				sevColor = X_yellow
+			case "possible":
+				sevColor = X_white
 			}
 			sb.WriteString(fmt.Sprintf("    - %s: %s [%s]%s\n", v.Name, sevColor, v.Severity, X_reset))
 			if len(v.Payloads) > 0 {
@@ -325,7 +350,9 @@ func dedupeConfirmedURLs(urls []string) []string {
 			}
 			uParsed.RawQuery = newQuery.Encode()
 			uParsed.Fragment = redactX9(uParsed.Fragment)
-			if uParsed.Path == "/" { uParsed.Path = "" }
+			if uParsed.Path == "/" {
+				uParsed.Path = ""
+			}
 			normalized = uParsed.String()
 		} else {
 			normalized = redactX9(u)
@@ -340,7 +367,9 @@ func dedupeConfirmedURLs(urls []string) []string {
 }
 
 func (tg *Telegram) notify(report VulnerabilityReport) {
-	if !report.HasVulns() { return }
+	if !report.HasVulns() {
+		return
+	}
 
 	if _, loaded := vulnerableMap.LoadOrStore(report.URL, true); !loaded {
 		atomic.AddInt64(&vulnerableTargets, 1)
@@ -368,7 +397,9 @@ func (tg *Telegram) notify(report VulnerabilityReport) {
 				break
 			}
 		}
-		if hasHighSeverity { break }
+		if hasHighSeverity {
+			break
+		}
 	}
 
 	if tg != nil && hasHighSeverity {
@@ -446,7 +477,9 @@ func stripANSI(str string) string {
 }
 
 func runCommand(name string, args ...string) (string, error) {
-	if name == "nuclei" && !nucleiExists { return "", nil }
+	if name == "nuclei" && !nucleiExists {
+		return "", nil
+	}
 	cmd := exec.Command(name, args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -482,9 +515,10 @@ func randomString(n int) string {
 	return string(s)
 }
 
-func confirmParameter(targetURL, phase, name string) (bool, string) {
+func confirmParameter(targetURL, phase, name string) (bool, []string) {
 	prefix := "x9" + randomString(3)
 	breakChars := []string{"'", "\"", "`", "<", ";", "{{"}
+	var confirmed []string
 
 	for _, bc := range breakChars {
 		p := prefix + bc
@@ -494,7 +528,9 @@ func confirmParameter(targetURL, phase, name string) (bool, string) {
 		finalURL := targetURL
 
 		u, err := url.Parse(targetURL)
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 
 		switch phase {
 		case "get":
@@ -512,9 +548,11 @@ func confirmParameter(targetURL, phase, name string) (bool, string) {
 			body = string(b)
 		}
 
-		if reflectionExists(finalURL, method, headers, body, p) { return true, p }
+		if reflectionExists(finalURL, method, headers, body, p) {
+			confirmed = append(confirmed, p)
+		}
 	}
-	return false, ""
+	return len(confirmed) > 0, confirmed
 }
 
 func reflectionExists(targetURL, method string, headers map[string]string, body, payload string) bool {
@@ -526,10 +564,14 @@ func reflectionExists(targetURL, method string, headers map[string]string, body,
 	} else {
 		req, _ = http.NewRequest("GET", targetURL, nil)
 	}
-	for k, v := range headers { req.Header.Set(k, v) }
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := client.Do(req)
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return strings.Contains(string(b), payload)
@@ -541,12 +583,18 @@ func processURL(targetURL string, index, total int) {
 	normalizedLockURL := targetURL
 	if err == nil {
 		uParsed.Path = strings.TrimSuffix(uParsed.Path, "/")
-		if strings.HasSuffix(uParsed.Path, "/index.php") { uParsed.Path = strings.TrimSuffix(uParsed.Path, "/index.php") }
-		if strings.HasSuffix(uParsed.Path, "/index.html") { uParsed.Path = strings.TrimSuffix(uParsed.Path, "/index.html") }
+		if strings.HasSuffix(uParsed.Path, "/index.php") {
+			uParsed.Path = strings.TrimSuffix(uParsed.Path, "/index.php")
+		}
+		if strings.HasSuffix(uParsed.Path, "/index.html") {
+			uParsed.Path = strings.TrimSuffix(uParsed.Path, "/index.html")
+		}
 		normalizedLockURL = uParsed.String()
 	}
 
-	if _, loaded := workerLock.LoadOrStore(normalizedLockURL, true); loaded { return }
+	if _, loaded := workerLock.LoadOrStore(normalizedLockURL, true); loaded {
+		return
+	}
 
 	atomic.AddInt64(&processedTargets, 1)
 	currProcessed := atomic.LoadInt64(&processedTargets)
@@ -564,7 +612,35 @@ func processURL(targetURL string, index, total int) {
 
 	probeOutputBase := filepath.Join(outputDir, safe+"-probe-out")
 	runCommand("./x9", "-probe", "-json", "-headers", "-dom", "-i", probeInput, "-o", probeOutputBase)
+	// Phase 2: Canary Probe - DOM query params
+	logLine("PHASE", X_cyan, "2/5 Canary Probing (DOM query params)...")
 
+	domQueryProbeFile := filepath.Join(outputDir, safe+"-dom-query-probe.txt")
+	if paramFile != "" {
+		if pf, err := os.Open(paramFile); err == nil {
+			var domProbeURLs []string
+			scanner := bufio.NewScanner(pf)
+			for scanner.Scan() {
+				param := strings.TrimSpace(scanner.Text())
+				if param == "" {
+					continue
+				}
+				canary := "x9canary" + randomString(3)
+				u, err := url.Parse(targetURL)
+				if err != nil {
+					continue
+				}
+				q := u.Query()
+				q.Set(param, canary)
+				u.RawQuery = q.Encode()
+				domProbeURLs = append(domProbeURLs, u.String())
+			}
+			pf.Close()
+			if len(domProbeURLs) > 0 {
+				os.WriteFile(domQueryProbeFile, []byte(strings.Join(domProbeURLs, "\n")), 0644)
+			}
+		}
+	}
 	// Phase 3: Filter Vulnerable Parameters
 	logLine("PHASE", X_blue, "3/5 Filtering reflective parameters...")
 	probeFiles := map[string]string{
@@ -602,24 +678,39 @@ func processURL(targetURL string, index, total int) {
 		logLine("INFO", X_gray, "No reflective parameters found.")
 		return
 	}
-
+	// در probeFiles map اضافه کن:
+	if _, err := os.Stat(domQueryProbeFile); err == nil {
+		lineCount := countLines(domQueryProbeFile)
+		logLine("DEBUG", X_gray, "DOM Query probe file has %d lines", lineCount)
+		res, _ := runCommand("nuclei", "-l", domQueryProbeFile, "-t", "dom_canary.yaml", "-headless", "-silent")
+		p3Findings["dom"] = append(p3Findings["dom"], extractURLsFromNuclei(res)...)
+	}
 	// Phase 4b: Confirmation Triage
 	logLine("PHASE", X_yellow, "4b/5 Triage & Context Confirmation...")
 	confirmedParams := make(map[string]map[string]bool)
-	for p := range p3Findings { confirmedParams[p] = make(map[string]bool) }
+	for p := range p3Findings {
+		confirmedParams[p] = make(map[string]bool)
+	}
 
 	for phase, urls := range p3Findings {
-		if phase == "dom" { continue }
+		if phase == "dom" {
+			continue
+		}
 		tempRep := VulnerabilityReport{URL: targetURL}
 		dummy := ""
-		for _, u := range urls { dummy += "[canary] [info] " + u + " [x9canary]\n" }
+		for _, u := range urls {
+			dummy += "[canary] [info] " + u + " [x9canary]\n"
+		}
 		tempRep.aggregateFindings(dummy, phase)
 
 		var vList *[]Vulnerability
 		switch phase {
-		case "get": vList = &tempRep.QueryParameters
-		case "header": vList = &tempRep.Headers
-		case "json": vList = &tempRep.JSONBody
+		case "get":
+			vList = &tempRep.QueryParameters
+		case "header":
+			vList = &tempRep.Headers
+		case "json":
+			vList = &tempRep.JSONBody
 		}
 
 		if vList != nil {
@@ -628,12 +719,15 @@ func processURL(targetURL string, index, total int) {
 				if ok, p := confirmParameter(targetURL, phase, v.Name); ok {
 					v.Confirmed = true
 					v.Severity = "confirmed"
-					v.Payloads = []string{p}
+					v.Payloads = p
 					confirmedParams[phase][v.Name] = true
 					switch phase {
-					case "get": report.QueryParameters = append(report.QueryParameters, v)
-					case "header": report.Headers = append(report.Headers, v)
-					case "json": report.JSONBody = append(report.JSONBody, v)
+					case "get":
+						report.QueryParameters = append(report.QueryParameters, v)
+					case "header":
+						report.Headers = append(report.Headers, v)
+					case "json":
+						report.JSONBody = append(report.JSONBody, v)
 					}
 					logLine("CONFIRM", X_green, "Confirmed XSS (%s): %s (param: %s)", phase, targetURL, v.Name)
 				}
@@ -646,10 +740,14 @@ func processURL(targetURL string, index, total int) {
 
 	httpAtkUrls := []string{}
 	for phase, urls := range p3Findings {
-		if phase == "dom" { continue }
+		if phase == "dom" {
+			continue
+		}
 		for _, u := range urls {
 			uParsedAtk, _ := url.Parse(u)
-			if uParsedAtk == nil { continue }
+			if uParsedAtk == nil {
+				continue
+			}
 			isConfirmed := false
 
 			// Phase 4 Skip Logic: Check all confirmed parameters for this phase
@@ -657,15 +755,25 @@ func processURL(targetURL string, index, total int) {
 			for name := range confirmedParams[phase] {
 				switch phase {
 				case "get":
-					if _, exists := query[name]; exists { isConfirmed = true }
+					if _, exists := query[name]; exists {
+						isConfirmed = true
+					}
 				case "header":
-					if strings.Contains(u, name+":") { isConfirmed = true }
+					if strings.Contains(u, name+":") {
+						isConfirmed = true
+					}
 				case "json":
-					if strings.Contains(u, "\""+name+"\"") { isConfirmed = true }
+					if strings.Contains(u, "\""+name+"\"") {
+						isConfirmed = true
+					}
 				}
-				if isConfirmed { break }
+				if isConfirmed {
+					break
+				}
 			}
-			if !isConfirmed { httpAtkUrls = append(httpAtkUrls, u) }
+			if !isConfirmed {
+				httpAtkUrls = append(httpAtkUrls, u)
+			}
 		}
 	}
 
@@ -695,7 +803,9 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 
-	if report.HasVulns() { tg.notify(report) }
+	if report.HasVulns() {
+		tg.notify(report)
+	}
 }
 
 func uniqueStrings(slice []string) []string {
@@ -712,8 +822,12 @@ func uniqueStrings(slice []string) []string {
 		}
 		// Bug 5: Normalize: remove trailing slash and common index files
 		u.Path = strings.TrimSuffix(u.Path, "/")
-		if strings.HasSuffix(u.Path, "/index.php") { u.Path = strings.TrimSuffix(u.Path, "/index.php") }
-		if strings.HasSuffix(u.Path, "/index.html") { u.Path = strings.TrimSuffix(u.Path, "/index.html") }
+		if strings.HasSuffix(u.Path, "/index.php") {
+			u.Path = strings.TrimSuffix(u.Path, "/index.php")
+		}
+		if strings.HasSuffix(u.Path, "/index.html") {
+			u.Path = strings.TrimSuffix(u.Path, "/index.html")
+		}
 
 		normalized := u.String()
 		if !keys[normalized] {
@@ -722,6 +836,23 @@ func uniqueStrings(slice []string) []string {
 		}
 	}
 	return list
+}
+
+func countLines(filename string) int {
+	file, err := os.Open(filename)
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	count := 0
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) != "" {
+			count++
+		}
+	}
+	return count
 }
 
 func main() {
@@ -754,13 +885,17 @@ func main() {
 	if *urlFile == "-" {
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
-			if u := strings.TrimSpace(scanner.Text()); u != "" { urls = append(urls, u) }
+			if u := strings.TrimSpace(scanner.Text()); u != "" {
+				urls = append(urls, u)
+			}
 		}
 	} else if *urlFile != "" {
 		file, _ := os.Open(*urlFile)
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
-			if u := strings.TrimSpace(scanner.Text()); u != "" { urls = append(urls, u) }
+			if u := strings.TrimSpace(scanner.Text()); u != "" {
+				urls = append(urls, u)
+			}
 		}
 		file.Close()
 	}
@@ -808,7 +943,9 @@ func main() {
 	if so, _ := runCommand("nuclei", "-l", finalIn, "-t", nucleiTemplate, "-silent"); so != "" {
 		soReport := VulnerabilityReport{URL: "Global Second-Order Check"}
 		soReport.aggregateFindings(so, "get")
-		if soReport.HasVulns() { tg.notify(soReport) }
+		if soReport.HasVulns() {
+			tg.notify(soReport)
+		}
 	}
 	fmt.Printf("\n%s[DONE]%s Pipeline Complete.\n", X_green, X_reset)
 }
