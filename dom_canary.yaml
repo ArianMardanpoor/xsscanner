@@ -75,7 +75,6 @@ headless:
               if (canaryPattern.test(document.documentElement.innerHTML)) {
                 window.capturedSinks.push("innerHTML_static");
               }
-              // Return unique sinks
               return [...new Set(window.capturedSinks)].join(",");
             })()
         name: dom_canary_reflection
@@ -90,6 +89,7 @@ headless:
           - "setTimeout"
           - "setInterval"
           - "document.write"
+          - "document.writeln"
           - "src"
           - "href"
 
@@ -97,4 +97,4 @@ headless:
       - type: regex
         part: dom_canary_reflection
         regex:
-          - "[a-zA-Z0-9_]+"
+          - "[a-zA-Z0-9_.]+"

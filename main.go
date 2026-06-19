@@ -144,7 +144,7 @@ func getSafeName(u string) string {
 	return regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(u, "_")
 }
 
-func processTarget(target string, mode string) {
+func processTarget(target string, isSingleTarget bool) {
 	logMsg(fmt.Sprintf("--- Starting: %s ---", target), M_purple+M_bold)
 
 	u, err := url.Parse(target)
@@ -202,15 +202,31 @@ func processTarget(target string, mode string) {
 		defer f.Close()
 		f.WriteString(target + "\n")
 
-		// Helper to append file content carefully
+		var targetHost string
+		if isSingleTarget {
+			targetHost = u.Host
+		}
+
+		// Helper to append file content carefully with optional filtering
 		appendSafe := func(path string) {
 			if pFile, err := os.Open(path); err == nil {
 				scanner := bufio.NewScanner(pFile)
 				for scanner.Scan() {
 					line := strings.TrimSpace(scanner.Text())
-					if line != "" {
-						f.WriteString(line + "\n")
+					if line == "" {
+						continue
 					}
+					// Bug 3: Filter results in single-target mode to exclude unrelated hosts
+					if isSingleTarget {
+						if lURL, err := url.Parse(line); err == nil {
+							if lURL.Host != targetHost {
+								continue
+							}
+						} else {
+							continue
+						}
+					}
+					f.WriteString(line + "\n")
 				}
 				pFile.Close()
 			}
@@ -218,15 +234,15 @@ func processTarget(target string, mode string) {
 
 		appendSafe(filepath.Join(passiveDir, hostname+".passive"))
 		appendSafe(filepath.Join(katanaDir, safeURL+"-katana.txt"))
-		// We no longer append raw params to job file. They are passed via -p flag.
 	}
 
 	// Run xssniper
-	runBinary("./xssniper", "-l", jobFile, "-p", paramFilePath, "-w", "3")
+	args := []string{"-l", jobFile, "-p", paramFilePath, "-w", "3"}
+	if isSingleTarget {
+		args = append(args, "-u", target)
+	}
+	runBinary("./xssniper", args...)
 
-	// Even in fresh mode we should probably mark as scanned if we want to avoid double scan in SAME run
-	// but the requirement said fresh mode scans everything.
-	// Let's mark as scanned to avoid rescanning in normal mode later.
 	markAsScanned(target)
 }
 
@@ -237,10 +253,12 @@ func main() {
 	flag.Parse()
 
 	var newTargets []string
+	isSingleTarget := false
 
 	if *targetURL != "" {
 		newTargets = []string{*targetURL}
 		logMsg(fmt.Sprintf("Single target mode: %s", *targetURL), M_cyan)
+		isSingleTarget = true
 	} else {
 		var rawTargets []string
 		if *inputFile != "" {
@@ -277,6 +295,6 @@ func main() {
 
 	logMsg(fmt.Sprintf("Ready to process %d targets in %s mode.", len(newTargets), strings.ToUpper(*mode)), M_cyan)
 	for _, target := range newTargets {
-		processTarget(target, *mode)
+		processTarget(target, isSingleTarget)
 	}
 }

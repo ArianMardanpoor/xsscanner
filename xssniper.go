@@ -1,5 +1,5 @@
 // FILE: xssniper.go — MODIFIED
-// Changes: Fix duplicate processing, improve payload capture, add URL filtering, and ensure DOM scan reliability.
+// Changes: Bug 1 (confirm payloads), Bug 4 (DOM debug logs & -dom flag), Bug 5 (normalization & deduplication), and Phase 4 optimization (skip confirmed).
 
 package main
 
@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -472,16 +473,21 @@ func extractURLsFromNuclei(nucleiOutput string) []string {
 
 // ── Core Logic ────────────────────────────────────────────────────────────────
 
-func confirmParameter(targetURL, phase, name string) (bool, string) {
-	payloads := []string{
-		`"><img src=x onerror=prompt(document.domain)>`,
-		`" onmouseover=prompt(document.domain) x="`,
-		`';prompt(document.domain)//`,
-		" `${prompt(document.domain)}` ",
-		`javascript:prompt(document.domain)`,
+func randomString(n int) string {
+	var letters = []rune("abcdefghijklmnopqrstuvwxyz")
+	s := make([]rune, n)
+	for i := range s {
+		s[i] = letters[rand.Intn(len(letters))]
 	}
+	return string(s)
+}
 
-	for _, p := range payloads {
+func confirmParameter(targetURL, phase, name string) (bool, string) {
+	prefix := "x9" + randomString(3)
+	breakChars := []string{"'", "\"", "`", "<", ";", "{{"}
+
+	for _, bc := range breakChars {
+		p := prefix + bc
 		method := "GET"
 		headers := make(map[string]string)
 		body := ""
@@ -501,8 +507,6 @@ func confirmParameter(targetURL, phase, name string) (bool, string) {
 		case "json":
 			method = "POST"
 			data := make(map[string]interface{})
-			// If we could parse original body, we'd preserve it.
-			// For now, we use a simple object as Task 4 asks for unencoded check.
 			data[name] = p
 			b, _ := json.Marshal(data)
 			body = string(b)
@@ -532,7 +536,17 @@ func reflectionExists(targetURL, method string, headers map[string]string, body,
 }
 
 func processURL(targetURL string, index, total int) {
-	if _, loaded := workerLock.LoadOrStore(targetURL, true); loaded { return }
+	// Bug 5: Normalize targetURL before checking workerLock
+	uParsed, err := url.Parse(targetURL)
+	normalizedLockURL := targetURL
+	if err == nil {
+		uParsed.Path = strings.TrimSuffix(uParsed.Path, "/")
+		if strings.HasSuffix(uParsed.Path, "/index.php") { uParsed.Path = strings.TrimSuffix(uParsed.Path, "/index.php") }
+		if strings.HasSuffix(uParsed.Path, "/index.html") { uParsed.Path = strings.TrimSuffix(uParsed.Path, "/index.html") }
+		normalizedLockURL = uParsed.String()
+	}
+
+	if _, loaded := workerLock.LoadOrStore(normalizedLockURL, true); loaded { return }
 
 	atomic.AddInt64(&processedTargets, 1)
 	currProcessed := atomic.LoadInt64(&processedTargets)
@@ -565,6 +579,16 @@ func processURL(targetURL string, index, total int) {
 	for pf, phase := range probeFiles {
 		if _, err := os.Stat(pf); err == nil {
 			if phase == "dom" {
+				// Bug 4: Add debug logs for DOM canary
+				content, _ := os.ReadFile(pf)
+				lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+				lineCount := 0
+				if len(lines) > 0 && lines[0] != "" {
+					lineCount = len(lines)
+				}
+				logLine("DEBUG", X_gray, "DOM Canary file %s has %d lines", pf, lineCount)
+				logLine("DEBUG", X_gray, "Invoking nuclei with dom_canary.yaml for %s", pf)
+
 				res, _ := runCommand("nuclei", "-l", pf, "-t", "dom_canary.yaml", "-headless", "-silent")
 				p3Findings["dom"] = append(p3Findings["dom"], extractURLsFromNuclei(res)...)
 			} else {
@@ -600,6 +624,7 @@ func processURL(targetURL string, index, total int) {
 
 		if vList != nil {
 			for _, v := range *vList {
+				// Bug 1: Use x9 break-character payloads for confirmation
 				if ok, p := confirmParameter(targetURL, phase, v.Name); ok {
 					v.Confirmed = true
 					v.Severity = "confirmed"
@@ -623,13 +648,22 @@ func processURL(targetURL string, index, total int) {
 	for phase, urls := range p3Findings {
 		if phase == "dom" { continue }
 		for _, u := range urls {
-			uDecoded, _ := url.QueryUnescape(u)
+			uParsedAtk, _ := url.Parse(u)
+			if uParsedAtk == nil { continue }
 			isConfirmed := false
+
+			// Phase 4 Skip Logic: Check all confirmed parameters for this phase
+			query := uParsedAtk.Query()
 			for name := range confirmedParams[phase] {
-				if strings.Contains(uDecoded, name+"=") || strings.Contains(uDecoded, name+":") || strings.Contains(uDecoded, "\""+name+"\"") {
-					isConfirmed = true
-					break
+				switch phase {
+				case "get":
+					if _, exists := query[name]; exists { isConfirmed = true }
+				case "header":
+					if strings.Contains(u, name+":") { isConfirmed = true }
+				case "json":
+					if strings.Contains(u, "\""+name+"\"") { isConfirmed = true }
 				}
+				if isConfirmed { break }
 			}
 			if !isConfirmed { httpAtkUrls = append(httpAtkUrls, u) }
 		}
@@ -653,6 +687,7 @@ func processURL(targetURL string, index, total int) {
 		atkIn := filepath.Join(outputDir, safe+"-dom-atk-in.txt")
 		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(p3Findings["dom"]), "\n")), 0644)
 		finalX9Base := filepath.Join(outputDir, safe+"-final-dom")
+		// Bug 4: Ensure x9 is called with -dom flag
 		runCommand("./x9", "-i", atkIn, "-dom", "-o", finalX9Base)
 
 		if dom, _ := runCommand("nuclei", "-l", finalX9Base+".dom.attack", "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
@@ -669,12 +704,22 @@ func uniqueStrings(slice []string) []string {
 	for _, entry := range slice {
 		u, err := url.Parse(entry)
 		if err != nil {
-			if !keys[entry] { keys[entry] = true; list = append(list, entry) }
+			if !keys[entry] {
+				keys[entry] = true
+				list = append(list, entry)
+			}
 			continue
 		}
-		if u.Path == "/" { u.Path = "" }
+		// Bug 5: Normalize: remove trailing slash and common index files
+		u.Path = strings.TrimSuffix(u.Path, "/")
+		if strings.HasSuffix(u.Path, "/index.php") { u.Path = strings.TrimSuffix(u.Path, "/index.php") }
+		if strings.HasSuffix(u.Path, "/index.html") { u.Path = strings.TrimSuffix(u.Path, "/index.html") }
+
 		normalized := u.String()
-		if !keys[normalized] { keys[normalized] = true; list = append(list, entry) }
+		if !keys[normalized] {
+			keys[normalized] = true
+			list = append(list, entry)
+		}
 	}
 	return list
 }
@@ -727,7 +772,7 @@ func main() {
 
 	urls = uniqueStrings(urls)
 
-	// Issue 4: Filter out localhost and non-matching hosts in single-target mode
+	// Bug 3: Filter out non-matching hosts in single-target mode
 	if *singleURL != "" {
 		uTarget, _ := url.Parse(*singleURL)
 		if uTarget != nil {
