@@ -2,82 +2,92 @@ id: dom-canary-headless
 
 info:
   name: DOM Canary Reflection Detection (Headless)
-  author: jules
+  author: arian & manus
   severity: info
   description: Detects simple canary reflection in DOM sinks to identify potentially vulnerable parameters for DOM XSS.
   tags: headless, dom, canary
 
 headless:
   - steps:
-      - action: navigate
+      - action: setheader
         args:
-          url: "{{BaseURL}}"
+          part: response
+          key: Content-Security-Policy
+          value: "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;"
 
       - action: script
         args:
+          hook: true
           code: |
-            (function() {
-              window.capturedSinks = window.capturedSinks || [];
+            () => {
+              window.capturedSinks = [];
               const canaryPattern = /x9canary[a-z]{3}/;
-
               function track(sinkName, value) {
                 if (canaryPattern.test(String(value))) {
                   window.capturedSinks.push(sinkName);
                 }
               }
-
-              // Hook Functions
-              const originalEval = window.eval;
-              window.eval = function(code) { track('eval', code); return originalEval.apply(this, arguments); };
-
-              const originalSetTimeout = window.setTimeout;
-              window.setTimeout = function(func, delay) { track('setTimeout', func); return originalSetTimeout.apply(this, arguments); };
-
-              const originalSetInterval = window.setInterval;
-              window.setInterval = function(func, delay) { track('setInterval', func); return originalSetInterval.apply(this, arguments); };
-
-              const originalWrite = document.write;
-              document.write = function(content) { track('document.write', content); return originalWrite.apply(document, arguments); };
-
-              const originalWriteln = document.writeln;
-              document.writeln = function(content) { track('document.writeln', content); return originalWriteln.apply(document, arguments); };
-
-              // Hook Setters
-              const hookSetter = (proto, prop) => {
-                const descriptor = Object.getOwnPropertyDescriptor(proto, prop);
-                if (descriptor && descriptor.set) {
+              try {
+                const origEval = window.eval;
+                window.eval = function(c) { track('eval', c); return origEval(c); };
+              } catch(e) {}
+              try {
+                const origST = window.setTimeout;
+                window.setTimeout = function(f, d) { track('setTimeout', String(f)); return origST(f, d); };
+              } catch(e) {}
+              try {
+                const origSI = window.setInterval;
+                window.setInterval = function(f, d) { track('setInterval', String(f)); return origSI(f, d); };
+              } catch(e) {}
+              try {
+                const origDW = document.write.bind(document);
+                document.write = function(c) { track('document.write', c); return origDW(c); };
+              } catch(e) {}
+              try {
+                const origDWL = document.writeln.bind(document);
+                document.writeln = function(c) { track('document.writeln', c); return origDWL(c); };
+              } catch(e) {}
+              var props = [
+                [Element.prototype, 'innerHTML'],
+                [Element.prototype, 'outerHTML'],
+                [HTMLImageElement.prototype, 'src'],
+                [HTMLScriptElement.prototype, 'src'],
+                [HTMLIFrameElement.prototype, 'src'],
+                [HTMLAnchorElement.prototype, 'href']
+              ];
+              props.forEach(function(item) {
+                try {
+                  var proto = item[0];
+                  var prop = item[1];
+                  var desc = Object.getOwnPropertyDescriptor(proto, prop);
+                  if (!desc || !desc.set || !desc.get) return;
                   Object.defineProperty(proto, prop, {
-                    set: function(val) {
-                      track(prop, val);
-                      return descriptor.set.apply(this, arguments);
-                    },
-                    get: function() { return descriptor.get.apply(this); },
-                    configurable: true
+                    configurable: true,
+                    get: function() { return desc.get.call(this); },
+                    set: function(v) { track(prop, v); desc.set.call(this, v); }
                   });
-                }
-              };
+                } catch(e) {}
+              });
+            }
 
-              hookSetter(Element.prototype, 'innerHTML');
-              hookSetter(Element.prototype, 'outerHTML');
-              hookSetter(HTMLImageElement.prototype, 'src');
-              hookSetter(HTMLScriptElement.prototype, 'src');
-              hookSetter(HTMLIFrameElement.prototype, 'src');
-              hookSetter(HTMLAnchorElement.prototype, 'href');
-            })();
+      - action: navigate
+        args:
+          url: "{{BaseURL}}"
 
       - action: waitload
 
       - action: script
+        name: dom_canary_reflection
         args:
           code: |
-            (function() {
+            () => {
+              window.capturedSinks = window.capturedSinks || [];
               const canaryPattern = /x9canary[a-z]{3}/;
               if (canaryPattern.test(document.documentElement.innerHTML)) {
                 window.capturedSinks.push("innerHTML_static");
               }
               return [...new Set(window.capturedSinks)].join(",");
-            })()
-        name: dom_canary_reflection
+            }
 
     matchers:
       - type: word
@@ -92,6 +102,7 @@ headless:
           - "document.writeln"
           - "src"
           - "href"
+          - "innerHTML_static"
 
     extractors:
       - type: regex

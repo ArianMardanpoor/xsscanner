@@ -125,15 +125,15 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 					}
 				}
 			}
-		case "dom":
+		case "dom", "dom_confirmed":
 			targetList = &r.DOM
-			if u, err := url.Parse(decodedURL); err == nil {
-				// Check fragment first
-				if strings.Contains(redactX9(u.Fragment), "x9") {
+			if u, err := url.Parse(rawURL); err == nil {
+				if u.Fragment != "" && strings.Contains(redactX9(u.Fragment), "x9") {
 					name = "fragment"
 				} else {
 					for k, v := range u.Query() {
-						if strings.Contains(redactX9(strings.Join(v, "")), "x9") {
+						val, _ := url.QueryUnescape(strings.Join(v, ""))
+						if strings.Contains(redactX9(val), "x9") {
 							name = k
 							break
 						}
@@ -163,8 +163,13 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 		}
 
 		severity := "possible"
-		if phase == "get" || phase == "dom" {
+		if phase == "get" {
 			severity = "likely"
+		} else if phase == "dom" {
+			severity = "likely"
+		} else if phase == "dom_confirmed" {
+			severity = "confirmed"
+			phase = "dom"
 		} else if phase == "header" || phase == "json" {
 			canary := ""
 			if m := reX9.FindString(injection); m != "" {
@@ -445,21 +450,21 @@ const (
 )
 
 var (
-	outputDir         string
-	nucleiTemplate    string
-	domTemplate       string
-	canaryTemplate    string
-	paramFile         string
-	concurrency       int
-	workers           int
-	mu                sync.Mutex
-	tg                *Telegram
-	allCrawledURLs    []string
-	processedTargets  int64
-	vulnerableTargets int64
-	vulnerableMap     sync.Map
-	workerLock        sync.Map
-	nucleiExists      bool
+	outputDir            string
+	nucleiTemplate       string
+	domTemplate          string
+	canaryTemplate       string
+	paramFile            string
+	concurrency          int
+	workers              int
+	mu                   sync.Mutex
+	tg                   *Telegram
+	allCrawledURLs       []string
+	processedTargets     int64
+	vulnerableTargets    int64
+	vulnerableMap        sync.Map
+	workerLock           sync.Map
+	nucleiExists         bool
 	nucleiHeadlessExists bool
 
 	reX9       = regexp.MustCompile(`x9(?:canary)?[a-z]*`)
@@ -830,18 +835,25 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 
-	// Phase 4c: DOM Query Attack
-	if len(p3Findings["dom"]) > 0 {
+	// Phase 4c: DOM Query Attack (only query param URLs, no fragments)
+	var domQueryURLs []string
+	for _, u := range p3Findings["dom"] {
+		parsed, err := url.Parse(u)
+		if err == nil && parsed.Fragment == "" {
+			domQueryURLs = append(domQueryURLs, u)
+		}
+	}
+
+	if len(domQueryURLs) > 0 {
 		logLine("PHASE", X_purple, "4c/5 Executing DOM Query Attacks...")
 		atkIn := filepath.Join(outputDir, safe+"-dom-query-atk-in.txt")
-		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(p3Findings["dom"]), "\n")), 0644)
+		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(domQueryURLs), "\n")), 0644)
 		finalX9Base := filepath.Join(outputDir, safe+"-final-dom-query")
-		// Bug 2: Run x9 without -dom flag for query param probes
 		runCommand("./x9", "-i", atkIn, "-o", finalX9Base)
 
 		if nucleiHeadlessExists {
 			if dom, _ := runCommand("nuclei", "-l", finalX9Base+".get", "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
-				report.aggregateFindings(dom, "dom")
+				report.aggregateFindings(dom, "dom_confirmed")
 			}
 		}
 	}
@@ -912,10 +924,14 @@ func main() {
 
 	if _, err := exec.LookPath("nuclei"); err == nil {
 		nucleiExists = true
-		// Check for headless support
-		hOut, hErr := runCommand("nuclei", "-headless", "-version")
-		if hErr == nil && strings.Contains(hOut, "nuclei") {
+		cmd := exec.Command("nuclei", "-headless", "-version")
+		var combined bytes.Buffer
+		cmd.Stdout = &combined
+		cmd.Stderr = &combined
+		cmd.Run()
+		if strings.Contains(combined.String(), "nuclei") {
 			nucleiHeadlessExists = true
+			logLine("INFO", X_green, "nuclei headless support confirmed")
 		} else {
 			logLine("WARN", X_yellow, "nuclei headless not available — DOM phases will be skipped")
 		}
@@ -957,7 +973,6 @@ func main() {
 
 	urls = uniqueStrings(urls)
 
-	// Bug 3: Filter out non-matching hosts in single-target mode
 	if *singleURL != "" {
 		uTarget, _ := url.Parse(*singleURL)
 		if uTarget != nil {
