@@ -460,6 +460,7 @@ var (
 	vulnerableMap     sync.Map
 	workerLock        sync.Map
 	nucleiExists      bool
+	nucleiHeadlessExists bool
 
 	reX9       = regexp.MustCompile(`x9(?:canary)?[a-z]*`)
 	rePayload  = regexp.MustCompile(`\[(?:"([^"]+)"|([^"\]]+))\]$`)
@@ -470,6 +471,13 @@ var (
 func logLine(level, color, format string, args ...interface{}) {
 	ts := time.Now().Format("15:04:05")
 	fmt.Printf("%s[%s]%s %s[%s]%s %s\n", X_gray, ts, X_reset, color, level, X_reset, fmt.Sprintf(format, args...))
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func stripANSI(str string) string {
@@ -655,18 +663,26 @@ func processURL(targetURL string, index, total int) {
 	for pf, phase := range probeFiles {
 		if _, err := os.Stat(pf); err == nil {
 			if phase == "dom" {
-				// Bug 4: Add debug logs for DOM canary
+				// Bug 3: Add enhanced debug logs for DOM canary
 				content, _ := os.ReadFile(pf)
 				lines := strings.Split(strings.TrimSpace(string(content)), "\n")
 				lineCount := 0
 				if len(lines) > 0 && lines[0] != "" {
 					lineCount = len(lines)
+					logLine("DEBUG", X_gray, "First %d lines of %s:", min(3, lineCount), pf)
+					for i := 0; i < min(3, lineCount); i++ {
+						logLine("DEBUG", X_gray, "  %s", lines[i])
+					}
 				}
 				logLine("DEBUG", X_gray, "DOM Canary file %s has %d lines", pf, lineCount)
-				logLine("DEBUG", X_gray, "Invoking nuclei with dom_canary.yaml for %s", pf)
 
-				res, _ := runCommand("nuclei", "-l", pf, "-t", "dom_canary.yaml", "-headless", "-silent")
-				p3Findings["dom"] = append(p3Findings["dom"], extractURLsFromNuclei(res)...)
+				if nucleiHeadlessExists {
+					cmdStr := fmt.Sprintf("nuclei -l %s -t dom_canary.yaml -headless -silent", pf)
+					logLine("DEBUG", X_gray, "Invoking: %s", cmdStr)
+					res, _ := runCommand("nuclei", "-l", pf, "-t", "dom_canary.yaml", "-headless", "-silent")
+					logLine("DEBUG", X_gray, "Raw Nuclei output for %s:\n%s", pf, res)
+					p3Findings["dom"] = append(p3Findings["dom"], extractURLsFromNuclei(res)...)
+				}
 			} else {
 				res, _ := runCommand("nuclei", "-l", pf, "-t", canaryTemplate, "-silent")
 				p3Findings[phase] = append(p3Findings[phase], extractURLsFromNuclei(res)...)
@@ -674,16 +690,25 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 
+	// Bug 1: Move DOM Query probe before triage and check
+	if _, err := os.Stat(domQueryProbeFile); err == nil {
+		if nucleiHeadlessExists {
+			lineCount := countLines(domQueryProbeFile)
+			logLine("DEBUG", X_gray, "DOM Query probe file has %d lines", lineCount)
+
+			cmdStr := fmt.Sprintf("nuclei -l %s -t dom_canary.yaml -headless -silent", domQueryProbeFile)
+			logLine("DEBUG", X_gray, "Invoking: %s", cmdStr)
+
+			res, _ := runCommand("nuclei", "-l", domQueryProbeFile, "-t", "dom_canary.yaml", "-headless", "-silent")
+			logLine("DEBUG", X_gray, "Raw Nuclei output for %s:\n%s", domQueryProbeFile, res)
+
+			p3Findings["dom"] = append(p3Findings["dom"], extractURLsFromNuclei(res)...)
+		}
+	}
+
 	if len(p3Findings) == 0 {
 		logLine("INFO", X_gray, "No reflective parameters found.")
 		return
-	}
-	// در probeFiles map اضافه کن:
-	if _, err := os.Stat(domQueryProbeFile); err == nil {
-		lineCount := countLines(domQueryProbeFile)
-		logLine("DEBUG", X_gray, "DOM Query probe file has %d lines", lineCount)
-		res, _ := runCommand("nuclei", "-l", domQueryProbeFile, "-t", "dom_canary.yaml", "-headless", "-silent")
-		p3Findings["dom"] = append(p3Findings["dom"], extractURLsFromNuclei(res)...)
 	}
 	// Phase 4b: Confirmation Triage
 	logLine("PHASE", X_yellow, "4b/5 Triage & Context Confirmation...")
@@ -798,8 +823,26 @@ func processURL(targetURL string, index, total int) {
 		// Bug 4: Ensure x9 is called with -dom flag
 		runCommand("./x9", "-i", atkIn, "-dom", "-o", finalX9Base)
 
-		if dom, _ := runCommand("nuclei", "-l", finalX9Base+".dom.attack", "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
-			report.aggregateFindings(dom, "dom")
+		if nucleiHeadlessExists {
+			if dom, _ := runCommand("nuclei", "-l", finalX9Base+".dom.attack", "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
+				report.aggregateFindings(dom, "dom")
+			}
+		}
+	}
+
+	// Phase 4c: DOM Query Attack
+	if len(p3Findings["dom"]) > 0 {
+		logLine("PHASE", X_purple, "4c/5 Executing DOM Query Attacks...")
+		atkIn := filepath.Join(outputDir, safe+"-dom-query-atk-in.txt")
+		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(p3Findings["dom"]), "\n")), 0644)
+		finalX9Base := filepath.Join(outputDir, safe+"-final-dom-query")
+		// Bug 2: Run x9 without -dom flag for query param probes
+		runCommand("./x9", "-i", atkIn, "-o", finalX9Base)
+
+		if nucleiHeadlessExists {
+			if dom, _ := runCommand("nuclei", "-l", finalX9Base+".get", "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
+				report.aggregateFindings(dom, "dom")
+			}
 		}
 	}
 
@@ -869,6 +912,13 @@ func main() {
 
 	if _, err := exec.LookPath("nuclei"); err == nil {
 		nucleiExists = true
+		// Check for headless support
+		hOut, hErr := runCommand("nuclei", "-headless", "-version")
+		if hErr == nil && strings.Contains(hOut, "nuclei") {
+			nucleiHeadlessExists = true
+		} else {
+			logLine("WARN", X_yellow, "nuclei headless not available — DOM phases will be skipped")
+		}
 	} else {
 		logLine("WARN", X_yellow, "Nuclei not found in PATH. Skipping nuclei phases.")
 	}
