@@ -130,54 +130,17 @@ func cleanParam(p string) string {
 	p = strings.TrimSpace(p)
 	return p
 }
-var (
-	blocklist = map[string]bool{
-		"dom1":           true,
-		"dom2":           true,
-		"domLink":         true,
-		"hash":           true,
-		"payload":        true,
-		"timeoutPayload": true,
-		"writePayload":   true,
-		"username":       true,
-	}
-	whitelist = map[string]bool{
-		"next":     true,
-		"frame":    true,
-		"code":     true,
-		"timeout":  true,
-		"write":    true,
-		"name":     true,
-		"url":      true,
-		"message":  true,
-		"template": true,
-		"callback": true,
-		"redirect": true,
-	}
-	camelCaseRegex = regexp.MustCompile(`^[a-z][a-z]+[A-Z]`)
-)
-
 func isValidParam(p string) bool {
-	// 1. Reject if in blocklist
-	if blocklist[p] {
-		return false
-	}
-
-	// 2. Reject if pure numbers
+	// پارامتر نباید فقط عدد باشد
 	if regexp.MustCompile(`^\d+$`).MatchString(p) {
 		return false
 	}
-
-	// 3. Reject if too short or too long
+	// پارامتر نباید خیلی کوتاه یا خیلی بلند باشد
 	if len(p) < 2 || len(p) > 50 {
 		return false
 	}
-
-	// 4. Soft filter: reject camelCase IF not in whitelist
-	if camelCaseRegex.MatchString(p) && !whitelist[p] {
-		return false
-	}
-
+	// پارامتر نباید شامل حروف بزرگ باشد (نام متغیر JS)
+	// اختیاری - بستگی به target دارد
 	return true
 }
 
@@ -219,7 +182,7 @@ func writeHostParamFile(outFile string, newParams []string) (int, error) {
 	var fresh []string
 	for _, p := range newParams {
 		p = cleanParam(p)
-		if p != "" && isValidParam(p) && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "\\") && !seen[p] {
+		if p != "" && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "\\") && !seen[p] {
 			seen[p] = true
 			fresh = append(fresh, p)
 		}
