@@ -130,17 +130,28 @@ func cleanParam(p string) string {
 	p = strings.TrimSpace(p)
 	return p
 }
+
 func isValidParam(p string) bool {
-	// پارامتر نباید فقط عدد باشد
+	// رد کن اگه فقط عدد باشه
 	if regexp.MustCompile(`^\d+$`).MatchString(p) {
 		return false
 	}
-	// پارامتر نباید خیلی کوتاه یا خیلی بلند باشد
+	// رد کن CSS variables
+	if strings.HasPrefix(p, "--") {
+		return false
+	}
+	// رد کن اگه شامل فاصله یا واحد CSS باشه
+	if strings.ContainsAny(p, " \t") {
+		return false
+	}
+	// رد کن اگه با واحد CSS تموم بشه
+	if regexp.MustCompile(`\d+(px|em|rem|vh|vw|ms|fr)$`).MatchString(p) {
+		return false
+	}
+	// طول معقول
 	if len(p) < 2 || len(p) > 50 {
 		return false
 	}
-	// پارامتر نباید شامل حروف بزرگ باشد (نام متغیر JS)
-	// اختیاری - بستگی به target دارد
 	return true
 }
 

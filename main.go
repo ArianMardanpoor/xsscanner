@@ -29,7 +29,7 @@ const (
 
 var (
 	apiURL          = "http://localhost:3131/api/http"
-	apiToken        = os.Getenv("WATCHTOWER_API_TOKEN")
+	apiToken        = "a21uc0lzeTcK"
 	oldTargetsFile  = "all_scanned_targets.txt"
 	globalOutputDir = "./results"
 )

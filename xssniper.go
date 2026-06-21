@@ -128,11 +128,13 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 		case "dom", "dom_confirmed":
 			targetList = &r.DOM
 			if u, err := url.Parse(rawURL); err == nil {
+				logLine("DEBUG", X_gray, "DOM parse rawURL=%s fragment=%s query=%s", rawURL, u.Fragment, u.RawQuery)
 				if u.Fragment != "" && strings.Contains(redactX9(u.Fragment), "x9") {
 					name = "fragment"
 				} else {
 					for k, v := range u.Query() {
 						val, _ := url.QueryUnescape(strings.Join(v, ""))
+						logLine("DEBUG", X_gray, "DOM checking param=%s val=%s redacted=%s", k, val, redactX9(val))
 						if strings.Contains(redactX9(val), "x9") {
 							name = k
 							break
@@ -210,6 +212,7 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 					}
 				}
 				if severityWeight(severity) > severityWeight((*targetList)[i].Severity) {
+					logLine("DEBUG", X_gray, "Upgrading DOM param=%s from=%s to=%s", name, (*targetList)[i].Severity, severity)
 					(*targetList)[i].Severity = severity
 				}
 				found = true
@@ -496,6 +499,7 @@ func runCommand(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &out
 	err := cmd.Run()
 	return out.String(), err
 }
@@ -780,7 +784,6 @@ func processURL(targetURL string, index, total int) {
 			}
 			isConfirmed := false
 
-			// Phase 4 Skip Logic: Check all confirmed parameters for this phase
 			query := uParsedAtk.Query()
 			for name := range confirmedParams[phase] {
 				switch phase {
@@ -821,17 +824,64 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 
-	if len(p3Findings["dom"]) > 0 {
+	// Phase 4 DOM: فقط fragment URLs (location.hash sinks)
+	var fragmentURLs []string
+	for _, u := range p3Findings["dom"] {
+		parsed, err := url.Parse(u)
+		if err == nil && parsed.Fragment != "" {
+			fragmentURLs = append(fragmentURLs, u)
+		}
+	}
+	if len(fragmentURLs) > 0 {
 		atkIn := filepath.Join(outputDir, safe+"-dom-atk-in.txt")
-		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(p3Findings["dom"]), "\n")), 0644)
+		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(fragmentURLs), "\n")), 0644)
 		finalX9Base := filepath.Join(outputDir, safe+"-final-dom")
-		// Bug 4: Ensure x9 is called with -dom flag
 		runCommand("./x9", "-i", atkIn, "-dom", "-o", finalX9Base)
-
 		if nucleiHeadlessExists {
 			if dom, _ := runCommand("nuclei", "-l", finalX9Base+".dom.attack", "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
 				report.aggregateFindings(dom, "dom")
 			}
+		}
+	}
+	// Add DOM canary findings to report as "likely" before Phase 4c
+	logLine("DEBUG", X_gray, "canary pre-loop: p3Findings dom len=%d", len(p3Findings["dom"]))
+	for _, u := range p3Findings["dom"] {
+		logLine("DEBUG", X_gray, "canary pre-parse: u=%s", u)
+		parsed, err := url.Parse(u)
+		if err != nil {
+			continue
+		}
+		name := ""
+		if parsed.Fragment != "" && strings.Contains(redactX9(parsed.Fragment), "x9") {
+			name = "fragment"
+		} else {
+			for k, v := range parsed.Query() {
+				val, _ := url.QueryUnescape(strings.Join(v, ""))
+				logLine("DEBUG", X_gray, "canary query check: k=%s val=%s redacted=%s", k, val, redactX9(val))
+				if strings.Contains(redactX9(val), "x9") {
+					name = k
+					break
+				}
+			}
+		}
+		if name == "" {
+			logLine("DEBUG", X_gray, "canary loop: name empty for URL: %s", u)
+			continue
+		}
+		logLine("DEBUG", X_gray, "canary loop: name=%s for URL: %s", name, u)
+		found := false
+		for _, v := range report.DOM {
+			if v.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			report.DOM = append(report.DOM, Vulnerability{
+				Name:     name,
+				Severity: "likely",
+				Payloads: []string{"innerHTML_static"},
+			})
 		}
 	}
 
@@ -843,16 +893,15 @@ func processURL(targetURL string, index, total int) {
 			domQueryURLs = append(domQueryURLs, u)
 		}
 	}
-
 	if len(domQueryURLs) > 0 {
 		logLine("PHASE", X_purple, "4c/5 Executing DOM Query Attacks...")
 		atkIn := filepath.Join(outputDir, safe+"-dom-query-atk-in.txt")
 		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(domQueryURLs), "\n")), 0644)
 		finalX9Base := filepath.Join(outputDir, safe+"-final-dom-query")
 		runCommand("./x9", "-i", atkIn, "-o", finalX9Base)
-
 		if nucleiHeadlessExists {
-			if dom, _ := runCommand("nuclei", "-l", finalX9Base+".get", "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
+			dom, _ := runCommand("nuclei", "-l", finalX9Base+".get", "-t", domTemplate, "-headless", "-silent", "-timeout", "300")
+			if dom != "" {
 				report.aggregateFindings(dom, "dom_confirmed")
 			}
 		}
@@ -862,7 +911,6 @@ func processURL(targetURL string, index, total int) {
 		tg.notify(report)
 	}
 }
-
 func uniqueStrings(slice []string) []string {
 	keys := make(map[string]bool)
 	var list []string
