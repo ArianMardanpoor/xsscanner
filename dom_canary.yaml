@@ -15,12 +15,18 @@ headless:
           key: Content-Security-Policy
           value: "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;"
 
+      - action: navigate
+        args:
+          url: "{{BaseURL}}"
+
+      - action: waitload
+
       - action: script
         args:
           hook: true
           code: |
             () => {
-              window.capturedSinks = [];
+              window.capturedSinks = window.capturedSinks || [];
               const canaryPattern = /x9canary[a-z]{3}/;
               function track(sinkName, value) {
                 if (canaryPattern.test(String(value))) {
@@ -29,15 +35,24 @@ headless:
               }
               try {
                 const origEval = window.eval;
-                window.eval = function(c) { track('eval', c); return origEval(c); };
+                window.eval = function(c) {
+                  track('eval', c);
+                  try { return origEval(c); } catch(e) {}
+                };
               } catch(e) {}
               try {
                 const origST = window.setTimeout;
-                window.setTimeout = function(f, d) { track('setTimeout', String(f)); return origST(f, d); };
+                window.setTimeout = function(f, d) {
+                  track('setTimeout', String(f));
+                  try { return origST(f, d); } catch(e) {}
+                };
               } catch(e) {}
               try {
                 const origSI = window.setInterval;
-                window.setInterval = function(f, d) { track('setInterval', String(f)); return origSI(f, d); };
+                window.setInterval = function(f, d) {
+                  track('setInterval', String(f));
+                  try { return origSI(f, d); } catch(e) {}
+                };
               } catch(e) {}
               try {
                 const origDW = document.write.bind(document);
@@ -68,25 +83,17 @@ headless:
                   });
                 } catch(e) {}
               });
+              if (canaryPattern.test(document.documentElement.innerHTML)) {
+                window.capturedSinks.push("innerHTML_static");
+              }
             }
-
-      - action: navigate
-        args:
-          url: "{{BaseURL}}"
-
-      - action: waitload
 
       - action: script
         name: dom_canary_reflection
         args:
           code: |
             () => {
-              window.capturedSinks = window.capturedSinks || [];
-              const canaryPattern = /x9canary[a-z]{3}/;
-              if (canaryPattern.test(document.documentElement.innerHTML)) {
-                window.capturedSinks.push("innerHTML_static");
-              }
-              return [...new Set(window.capturedSinks)].join(",");
+              return [...new Set(window.capturedSinks || [])].join(",") || "";
             }
 
     matchers:

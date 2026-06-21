@@ -8,3 +8,5 @@ xssniper
 output/
 results/
 all_scanned_targets.txt
+go.mod
+go.sum

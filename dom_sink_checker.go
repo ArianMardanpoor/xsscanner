@@ -1,0 +1,126 @@
+package main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
+)
+
+const canaryHook = `
+    window.__capturedSinks = [];
+    const pat = /x9canary[a-z]{3}/;
+    function track(sink, val) {
+        if (pat.test(String(val))) window.__capturedSinks.push(sink);
+    }
+    const origEval = window.eval;
+    window.eval = function(c) { track('eval', c); try { return origEval(c); } catch(e) {} };
+    const origST = window.setTimeout;
+    window.setTimeout = function(f,d) { track('setTimeout',String(f)); try { return origST(f,d); } catch(e) {} };
+    const origSI = window.setInterval;
+    window.setInterval = function(f,d) { track('setInterval',String(f)); try { return origSI(f,d); } catch(e) {} };
+    const origDW = document.write.bind(document);
+    document.write = function(c) { track('document.write',c); return origDW(c); };
+    const origDWL = document.writeln.bind(document);
+    document.writeln = function(c) { track('document.writeln',c); return origDWL(c); };
+`
+
+const xssHook = `
+    window.__capturedSinks = [];
+    const pat = /x9[a-z]{3}['"` + "`" + `\\;<{]/;
+    function track(sink, val) {
+        if (pat.test(String(val))) window.__capturedSinks.push(sink);
+    }
+    const origEval = window.eval;
+    window.eval = function(c) { track('eval', c); try { return origEval(c); } catch(e) {} };
+    const origST = window.setTimeout;
+    window.setTimeout = function(f,d) { track('setTimeout',String(f)); try { return origST(f,d); } catch(e) {} };
+    const origSI = window.setInterval;
+    window.setInterval = function(f,d) { track('setInterval',String(f)); try { return origSI(f,d); } catch(e) {} };
+    const origDW = document.write.bind(document);
+    document.write = function(c) { track('document.write',c); return origDW(c); };
+    const origDWL = document.writeln.bind(document);
+    document.writeln = function(c) { track('document.writeln',c); return origDWL(c); };
+`
+
+func checkURL(browser *rod.Browser, targetURL, hookCode string, timeout int) {
+	page, err := browser.Page(proto.TargetCreateTarget{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[ERROR] could not create page: %v\n", err)
+		return
+	}
+	defer page.MustClose()
+
+	// ✅ تغییر اعمال شده در این خط: اضافه شدن ,_ برای دریافت صحیح خروجی‌ها
+	if _, err := page.EvalOnNewDocument(hookCode); err != nil {
+		fmt.Fprintf(os.Stderr, "[ERROR] EvalOnNewDocument failed: %v\n", err)
+		return
+	}
+
+	err = page.Timeout(time.Duration(timeout) * time.Second).Navigate(targetURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] navigate failed for %s: %v\n", targetURL, err)
+		return
+	}
+
+	page.Timeout(time.Duration(timeout) * time.Second).WaitLoad()
+	time.Sleep(200 * time.Millisecond)
+
+	result, err := page.Eval(`() => [...new Set(window.__capturedSinks || [])].join(",")`)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[ERROR] eval failed: %v\n", err)
+		return
+	}
+
+	sinks := result.Value.String()
+	if sinks != "" {
+		for _, sink := range strings.Split(sinks, ",") {
+			sink = strings.TrimSpace(sink)
+			if sink != "" {
+				fmt.Printf("[dom-sink-checker] [headless] [info] %s [\"%s\"]\n", targetURL, sink)
+			}
+		}
+	}
+}
+
+func main() {
+	xssMode := flag.Bool("xss", false, "Use break-char pattern instead of canary pattern")
+	timeout := flag.Int("timeout", 15, "Timeout per page in seconds")
+	inputFile := flag.String("l", "", "Input file with URLs")
+	flag.Parse()
+
+	hookCode := canaryHook
+	if *xssMode {
+		hookCode = xssHook
+	}
+
+	u := launcher.New().NoSandbox(true).MustLaunch()
+	browser := rod.New().ControlURL(u).MustConnect()
+	defer browser.MustClose()
+
+	var scanner *bufio.Scanner
+	if *inputFile == "" || *inputFile == "-" {
+		scanner = bufio.NewScanner(os.Stdin)
+	} else {
+		f, err := os.Open(*inputFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ERROR] cannot open file: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		scanner = bufio.NewScanner(f)
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && strings.HasPrefix(line, "http") {
+			checkURL(browser, line, hookCode, *timeout)
+		}
+	}
+}
