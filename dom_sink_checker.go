@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -49,6 +50,11 @@ const xssHook = `
     document.writeln = function(c) { track('document.writeln',c); return origDWL(c); };
 `
 
+type DomSinkOutput struct {
+	URL   string   `json:"url"`
+	Sinks []string `json:"sinks"`
+}
+
 func checkURL(browser *rod.Browser, targetURL, hookCode string, timeout int) {
 	page, err := browser.Page(proto.TargetCreateTarget{})
 	if err != nil {
@@ -57,7 +63,6 @@ func checkURL(browser *rod.Browser, targetURL, hookCode string, timeout int) {
 	}
 	defer page.MustClose()
 
-	// ✅ تغییر اعمال شده در این خط: اضافه شدن ,_ برای دریافت صحیح خروجی‌ها
 	if _, err := page.EvalOnNewDocument(hookCode); err != nil {
 		fmt.Fprintf(os.Stderr, "[ERROR] EvalOnNewDocument failed: %v\n", err)
 		return
@@ -78,13 +83,26 @@ func checkURL(browser *rod.Browser, targetURL, hookCode string, timeout int) {
 		return
 	}
 
-	sinks := result.Value.String()
-	if sinks != "" {
-		for _, sink := range strings.Split(sinks, ",") {
+	sinksStr := result.Value.String()
+	if sinksStr != "" {
+		var sinks []string
+		for _, sink := range strings.Split(sinksStr, ",") {
 			sink = strings.TrimSpace(sink)
 			if sink != "" {
-				fmt.Printf("[dom-sink-checker] [headless] [info] %s [\"%s\"]\n", targetURL, sink)
+				sinks = append(sinks, sink)
 			}
+		}
+		if len(sinks) > 0 {
+			output := DomSinkOutput{
+				URL:   targetURL,
+				Sinks: sinks,
+			}
+			jsonData, err := json.Marshal(output)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[ERROR] marshal failed: %v\n", err)
+				return
+			}
+			fmt.Println(string(jsonData))
 		}
 	}
 }
