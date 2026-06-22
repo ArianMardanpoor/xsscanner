@@ -30,6 +30,26 @@ const canaryHook = `
     document.write = function(c) { track('document.write',c); return origDW(c); };
     const origDWL = document.writeln.bind(document);
     document.writeln = function(c) { track('document.writeln',c); return origDWL(c); };
+    var props = [
+        [Element.prototype, 'innerHTML'],
+        [Element.prototype, 'outerHTML'],
+        [HTMLImageElement.prototype, 'src'],
+        [HTMLScriptElement.prototype, 'src'],
+        [HTMLIFrameElement.prototype, 'src'],
+        [HTMLAnchorElement.prototype, 'href']
+    ];
+    props.forEach(function(item) {
+        try {
+            var proto = item[0], prop = item[1];
+            var desc = Object.getOwnPropertyDescriptor(proto, prop);
+            if (!desc || !desc.set || !desc.get) return;
+            Object.defineProperty(proto, prop, {
+                configurable: true,
+                get: function() { return desc.get.call(this); },
+                set: function(v) { track(prop, v); desc.set.call(this, v); }
+            });
+        } catch(e) {}
+    });
 `
 
 const xssHook = `
@@ -48,6 +68,26 @@ const xssHook = `
     document.write = function(c) { track('document.write',c); return origDW(c); };
     const origDWL = document.writeln.bind(document);
     document.writeln = function(c) { track('document.writeln',c); return origDWL(c); };
+    var props = [
+        [Element.prototype, 'innerHTML'],
+        [Element.prototype, 'outerHTML'],
+        [HTMLImageElement.prototype, 'src'],
+        [HTMLScriptElement.prototype, 'src'],
+        [HTMLIFrameElement.prototype, 'src'],
+        [HTMLAnchorElement.prototype, 'href']
+    ];
+    props.forEach(function(item) {
+        try {
+            var proto = item[0], prop = item[1];
+            var desc = Object.getOwnPropertyDescriptor(proto, prop);
+            if (!desc || !desc.set || !desc.get) return;
+            Object.defineProperty(proto, prop, {
+                configurable: true,
+                get: function() { return desc.get.call(this); },
+                set: function(v) { track(prop, v); desc.set.call(this, v); }
+            });
+        } catch(e) {}
+    });
 `
 
 type DomSinkOutput struct {
