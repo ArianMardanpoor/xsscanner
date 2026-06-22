@@ -1,5 +1,6 @@
 .env
 nice_katana
+dom_sink_checker
 nice_params
 nice_passive
 xsscanner
