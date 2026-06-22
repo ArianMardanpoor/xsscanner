@@ -1,5 +1,5 @@
 // FILE: xssniper.go — MODIFIED
-// Changes: Bug 1 (confirm payloads), Bug 4 (DOM debug logs & -dom flag), Bug 5 (normalization & deduplication), and Phase 4 optimization (skip confirmed).
+// Changes: Replaced nuclei headless with dom_sink_checker for DOM XSS detection.
 
 package main
 
@@ -47,12 +47,85 @@ type VulnerabilityReport struct {
 	DOM             []Vulnerability `json:"dom,omitempty"`
 }
 
+type DomSinkOutput struct {
+	URL   string   `json:"url"`
+	Sinks []string `json:"sinks"`
+}
+
 func (r *VulnerabilityReport) HasVulns() bool {
 	return len(r.QueryParameters) > 0 || len(r.Headers) > 0 || len(r.JSONBody) > 0 || len(r.DOM) > 0
 }
 
 func redactX9(s string) string {
 	return reX9.ReplaceAllString(s, "x9")
+}
+
+func (r *VulnerabilityReport) processDomJson(domOut DomSinkOutput, phase string) {
+	u, err := url.Parse(domOut.URL)
+	if err != nil {
+		return
+	}
+
+	name := "unknown"
+	logLine("DEBUG", X_gray, "DOM parse rawURL=%s fragment=%s query=%s", domOut.URL, u.Fragment, u.RawQuery)
+	if u.Fragment != "" && strings.Contains(redactX9(u.Fragment), "x9") {
+		name = "fragment"
+	} else {
+		for k, v := range u.Query() {
+			val, _ := url.QueryUnescape(strings.Join(v, ""))
+			logLine("DEBUG", X_gray, "DOM checking param=%s val=%s redacted=%s", k, val, redactX9(val))
+			if strings.Contains(redactX9(val), "x9") {
+				name = k
+				break
+			}
+		}
+	}
+
+	if name == "unknown" {
+		return
+	}
+
+	severity := "likely"
+	confirmed := false
+	if phase == "dom_confirmed" {
+		severity = "confirmed"
+		confirmed = true
+	}
+
+	found := false
+	for i, v := range r.DOM {
+		if v.Name == name {
+			for _, sink := range domOut.Sinks {
+				exists := false
+				for _, p := range v.Payloads {
+					if p == sink {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					r.DOM[i].Payloads = append(r.DOM[i].Payloads, sink)
+				}
+			}
+			if severityWeight(severity) > severityWeight(v.Severity) {
+				logLine("DEBUG", X_gray, "Upgrading DOM param=%s from=%s to=%s", name, v.Severity, severity)
+				r.DOM[i].Severity = severity
+			}
+			if confirmed {
+				r.DOM[i].Confirmed = true
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		r.DOM = append(r.DOM, Vulnerability{
+			Name:      name,
+			Severity:  severity,
+			Confirmed: confirmed,
+			Payloads:  domOut.Sinks,
+		})
+	}
 }
 
 func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase string) {
@@ -67,6 +140,15 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 		line = reCleaning.ReplaceAllString(line, "")
 		if line == "" {
 			continue
+		}
+
+		// Handle DOM JSON output from dom_sink_checker
+		if (phase == "dom" || phase == "dom_confirmed") && strings.HasPrefix(line, "{") {
+			var domOut DomSinkOutput
+			if err := json.Unmarshal([]byte(line), &domOut); err == nil {
+				r.processDomJson(domOut, phase)
+				continue
+			}
 		}
 
 		// 1. Extract payload
@@ -468,7 +550,7 @@ var (
 	vulnerableMap        sync.Map
 	workerLock           sync.Map
 	nucleiExists         bool
-	nucleiHeadlessExists bool
+	domSinkCheckerExists bool
 
 	reX9       = regexp.MustCompile(`x9(?:canary)?[a-z]*`)
 	rePayload  = regexp.MustCompile(`\[(?:"([^"]+)"|([^"\]]+))\]$`)
@@ -685,12 +767,18 @@ func processURL(targetURL string, index, total int) {
 				}
 				logLine("DEBUG", X_gray, "DOM Canary file %s has %d lines", pf, lineCount)
 
-				if nucleiHeadlessExists {
-					cmdStr := fmt.Sprintf("nuclei -l %s -t dom_canary.yaml -headless -silent", pf)
-					logLine("DEBUG", X_gray, "Invoking: %s", cmdStr)
-					res, _ := runCommand("nuclei", "-l", pf, "-t", "dom_canary.yaml", "-headless", "-silent")
-					logLine("DEBUG", X_gray, "Raw Nuclei output for %s:\n%s", pf, res)
-					p3Findings["dom"] = append(p3Findings["dom"], extractURLsFromNuclei(res)...)
+				if domSinkCheckerExists {
+					logLine("DEBUG", X_gray, "Invoking: ./dom_sink_checker -l %s", pf)
+					res, _ := runCommand("./dom_sink_checker", "-l", pf)
+					logLine("DEBUG", X_gray, "Raw dom_sink_checker output for %s:\n%s", pf, res)
+					if res != "" {
+						lines := strings.Split(strings.TrimSpace(res), "\n")
+						for _, l := range lines {
+							if l != "" {
+								p3Findings["dom"] = append(p3Findings["dom"], l)
+							}
+						}
+					}
 				}
 			} else {
 				res, _ := runCommand("nuclei", "-l", pf, "-t", canaryTemplate, "-silent")
@@ -701,17 +789,23 @@ func processURL(targetURL string, index, total int) {
 
 	// Bug 1: Move DOM Query probe before triage and check
 	if _, err := os.Stat(domQueryProbeFile); err == nil {
-		if nucleiHeadlessExists {
+		if domSinkCheckerExists {
 			lineCount := countLines(domQueryProbeFile)
 			logLine("DEBUG", X_gray, "DOM Query probe file has %d lines", lineCount)
 
-			cmdStr := fmt.Sprintf("nuclei -l %s -t dom_canary.yaml -headless -silent", domQueryProbeFile)
-			logLine("DEBUG", X_gray, "Invoking: %s", cmdStr)
+			logLine("DEBUG", X_gray, "Invoking: ./dom_sink_checker -l %s", domQueryProbeFile)
 
-			res, _ := runCommand("nuclei", "-l", domQueryProbeFile, "-t", "dom_canary.yaml", "-headless", "-silent")
-			logLine("DEBUG", X_gray, "Raw Nuclei output for %s:\n%s", domQueryProbeFile, res)
+			res, _ := runCommand("./dom_sink_checker", "-l", domQueryProbeFile)
+			logLine("DEBUG", X_gray, "Raw dom_sink_checker output for %s:\n%s", domQueryProbeFile, res)
 
-			p3Findings["dom"] = append(p3Findings["dom"], extractURLsFromNuclei(res)...)
+			if res != "" {
+				lines := strings.Split(strings.TrimSpace(res), "\n")
+				for _, l := range lines {
+					if l != "" {
+						p3Findings["dom"] = append(p3Findings["dom"], l)
+					}
+				}
+			}
 		}
 	}
 
@@ -826,10 +920,14 @@ func processURL(targetURL string, index, total int) {
 
 	// Phase 4 DOM: فقط fragment URLs (location.hash sinks)
 	var fragmentURLs []string
-	for _, u := range p3Findings["dom"] {
-		parsed, err := url.Parse(u)
+	for _, line := range p3Findings["dom"] {
+		var domOut DomSinkOutput
+		if err := json.Unmarshal([]byte(line), &domOut); err != nil {
+			continue
+		}
+		parsed, err := url.Parse(domOut.URL)
 		if err == nil && parsed.Fragment != "" {
-			fragmentURLs = append(fragmentURLs, u)
+			fragmentURLs = append(fragmentURLs, domOut.URL)
 		}
 	}
 	if len(fragmentURLs) > 0 {
@@ -837,60 +935,32 @@ func processURL(targetURL string, index, total int) {
 		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(fragmentURLs), "\n")), 0644)
 		finalX9Base := filepath.Join(outputDir, safe+"-final-dom")
 		runCommand("./x9", "-i", atkIn, "-dom", "-o", finalX9Base)
-		if nucleiHeadlessExists {
-			if dom, _ := runCommand("nuclei", "-l", finalX9Base+".dom.attack", "-t", domTemplate, "-headless", "-silent", "-timeout", "300"); dom != "" {
-				report.aggregateFindings(dom, "dom")
+		if domSinkCheckerExists {
+			if dom, _ := runCommand("./dom_sink_checker", "-xss", "-l", finalX9Base+".dom.attack", "-timeout", "300"); dom != "" {
+				report.aggregateFindings(dom, "dom_confirmed")
 			}
 		}
 	}
 	// Add DOM canary findings to report as "likely" before Phase 4c
 	logLine("DEBUG", X_gray, "canary pre-loop: p3Findings dom len=%d", len(p3Findings["dom"]))
-	for _, u := range p3Findings["dom"] {
-		logLine("DEBUG", X_gray, "canary pre-parse: u=%s", u)
-		parsed, err := url.Parse(u)
-		if err != nil {
+	for _, line := range p3Findings["dom"] {
+		var domOut DomSinkOutput
+		if err := json.Unmarshal([]byte(line), &domOut); err != nil {
 			continue
 		}
-		name := ""
-		if parsed.Fragment != "" && strings.Contains(redactX9(parsed.Fragment), "x9") {
-			name = "fragment"
-		} else {
-			for k, v := range parsed.Query() {
-				val, _ := url.QueryUnescape(strings.Join(v, ""))
-				logLine("DEBUG", X_gray, "canary query check: k=%s val=%s redacted=%s", k, val, redactX9(val))
-				if strings.Contains(redactX9(val), "x9") {
-					name = k
-					break
-				}
-			}
-		}
-		if name == "" {
-			logLine("DEBUG", X_gray, "canary loop: name empty for URL: %s", u)
-			continue
-		}
-		logLine("DEBUG", X_gray, "canary loop: name=%s for URL: %s", name, u)
-		found := false
-		for _, v := range report.DOM {
-			if v.Name == name {
-				found = true
-				break
-			}
-		}
-		if !found {
-			report.DOM = append(report.DOM, Vulnerability{
-				Name:     name,
-				Severity: "likely",
-				Payloads: []string{"innerHTML_static"},
-			})
-		}
+		report.processDomJson(domOut, "dom")
 	}
 
 	// Phase 4c: DOM Query Attack (only query param URLs, no fragments)
 	var domQueryURLs []string
-	for _, u := range p3Findings["dom"] {
-		parsed, err := url.Parse(u)
+	for _, line := range p3Findings["dom"] {
+		var domOut DomSinkOutput
+		if err := json.Unmarshal([]byte(line), &domOut); err != nil {
+			continue
+		}
+		parsed, err := url.Parse(domOut.URL)
 		if err == nil && parsed.Fragment == "" {
-			domQueryURLs = append(domQueryURLs, u)
+			domQueryURLs = append(domQueryURLs, domOut.URL)
 		}
 	}
 	if len(domQueryURLs) > 0 {
@@ -899,8 +969,8 @@ func processURL(targetURL string, index, total int) {
 		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(domQueryURLs), "\n")), 0644)
 		finalX9Base := filepath.Join(outputDir, safe+"-final-dom-query")
 		runCommand("./x9", "-i", atkIn, "-o", finalX9Base)
-		if nucleiHeadlessExists {
-			dom, _ := runCommand("nuclei", "-l", finalX9Base+".get", "-t", domTemplate, "-headless", "-silent", "-timeout", "300")
+		if domSinkCheckerExists {
+			dom, _ := runCommand("./dom_sink_checker", "-xss", "-l", finalX9Base+".get", "-timeout", "300")
 			if dom != "" {
 				report.aggregateFindings(dom, "dom_confirmed")
 			}
@@ -972,19 +1042,15 @@ func main() {
 
 	if _, err := exec.LookPath("nuclei"); err == nil {
 		nucleiExists = true
-		cmd := exec.Command("nuclei", "-headless", "-version")
-		var combined bytes.Buffer
-		cmd.Stdout = &combined
-		cmd.Stderr = &combined
-		cmd.Run()
-		if strings.Contains(combined.String(), "nuclei") {
-			nucleiHeadlessExists = true
-			logLine("INFO", X_green, "nuclei headless support confirmed")
-		} else {
-			logLine("WARN", X_yellow, "nuclei headless not available — DOM phases will be skipped")
-		}
 	} else {
 		logLine("WARN", X_yellow, "Nuclei not found in PATH. Skipping nuclei phases.")
+	}
+
+	if _, err := exec.LookPath("./dom_sink_checker"); err == nil {
+		domSinkCheckerExists = true
+		logLine("INFO", X_green, "dom_sink_checker confirmed")
+	} else {
+		logLine("WARN", X_yellow, "dom_sink_checker not found or not executable — DOM phases will be skipped")
 	}
 
 	loadEnv()
