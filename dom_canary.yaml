@@ -15,6 +15,12 @@ headless:
           key: Content-Security-Policy
           value: "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;"
 
+      - action: navigate
+        args:
+          url: "{{BaseURL}}"
+
+      - action: waitload
+
       - action: script
         args:
           hook: true
@@ -81,16 +87,6 @@ headless:
                 window.capturedSinks.push("innerHTML_static");
               }
             }
-
-      - action: navigate
-        args:
-          url: "{{BaseURL}}"
-
-      - action: waitload
-
-      - action: sleep
-        args:
-          duration: 0.2
 
       - action: script
         name: dom_canary_reflection
