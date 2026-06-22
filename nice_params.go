@@ -37,21 +37,25 @@ var (
 	x8ParamRegex = regexp.MustCompile(`(?:GET|POST)\s+\S+\s+%\s+(.+)`)
 	cleanupRegex = regexp.MustCompile(`%+$`)
 	x8FoundRegex = regexp.MustCompile(`\[\+\]\s+(\w[\w\-.]*)`)
+
+	reNumeric = regexp.MustCompile(`^\d+$`)
+	reCSSUnit = regexp.MustCompile(`\d+(px|em|rem|vh|vw|ms|fr)$`)
 )
 
 // ─── Config & State ────────────────────────────────────────────────────────────
 
 type Config struct {
-	URL      string
-	URLFile  string
-	OutDir   string // Directory to save HOST-param.txt files
-	Wordlist string
-	Silent   bool
-	KeepTemp bool
-	Threads  int
-	Timeout  int
-	NoX8     bool
-	NoFall   bool
+	URL       string
+	URLFile   string
+	OutDir    string // Directory to save HOST-param.txt files
+	Wordlist  string
+	Silent    bool
+	KeepTemp  bool
+	Threads   int
+	Timeout   int
+	NoX8      bool
+	NoFall    bool
+	MaxParams int
 }
 
 var (
@@ -88,8 +92,6 @@ func printf(format string, args ...interface{}) {
 func logErrorMsg(msg string) {
 	logMu.Lock()
 	defer logMu.Unlock()
-	// In a real application, you might write to a log file here.
-	// For this example, we'll just print to stderr.
 	fmt.Fprintf(os.Stderr, "[ERROR] %s\n", msg)
 }
 
@@ -132,24 +134,24 @@ func cleanParam(p string) string {
 }
 
 func isValidParam(p string) bool {
-	// رد کن اگه فقط عدد باشه
-	if regexp.MustCompile(`^\d+$`).MatchString(p) {
+	// Length window 2-50
+	if len(p) < 2 || len(p) > 50 {
 		return false
 	}
-	// رد کن CSS variables
+	// Reject pure numeric
+	if reNumeric.MatchString(p) {
+		return false
+	}
+	// Reject CSS variables
 	if strings.HasPrefix(p, "--") {
 		return false
 	}
-	// رد کن اگه شامل فاصله یا واحد CSS باشه
-	if strings.ContainsAny(p, " \t") {
+	// Reject whitespace
+	if strings.ContainsAny(p, " \t\n\r") {
 		return false
 	}
-	// رد کن اگه با واحد CSS تموم بشه
-	if regexp.MustCompile(`\d+(px|em|rem|vh|vw|ms|fr)$`).MatchString(p) {
-		return false
-	}
-	// طول معقول
-	if len(p) < 2 || len(p) > 50 {
+	// Reject CSS units
+	if reCSSUnit.MatchString(p) {
 		return false
 	}
 	return true
@@ -165,7 +167,7 @@ func readParams(filename string) ([]string, error) {
 	sc := bufio.NewScanner(strings.NewReader(string(content)))
 	for sc.Scan() {
 		p := cleanParam(sc.Text())
-		if p != "" && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "\\") && !seen[p] {
+		if p != "" && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "\\") && isValidParam(p) && !seen[p] {
 			seen[p] = true
 			out = append(out, p)
 		}
@@ -175,43 +177,72 @@ func readParams(filename string) ([]string, error) {
 
 var fileMu sync.Mutex
 
-func writeHostParamFile(outFile string, newParams []string) (int, error) {
+func writeHostParamFile(outFile string, x8Params []string, fallParams []string, maxParams int) (int, error) {
 	fileMu.Lock()
 	defer fileMu.Unlock()
 
 	existing, err := readParams(outFile)
 	if err != nil && !os.IsNotExist(err) {
-		// Log error if file exists but cannot be read, but continue if file doesn't exist
 		logErrorMsg(fmt.Sprintf("failed to read existing params from %s: %v", outFile, err))
 	}
 
-	seen := make(map[string]bool, len(existing))
-	for _, p := range existing {
-		seen[p] = true
-	}
+	seen := make(map[string]bool)
+	var final []string
 
-	var fresh []string
-	for _, p := range newParams {
-		p = cleanParam(p)
-		if p != "" && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "\\") && !seen[p] {
+	// 1. Prioritize existing content
+	for _, p := range existing {
+		if !seen[p] && len(final) < maxParams {
 			seen[p] = true
-			fresh = append(fresh, p)
+			final = append(final, p)
 		}
 	}
 
-	if len(fresh) == 0 {
+	// 2. Prioritize X8 parameters
+	x8Dropped := 0
+	for _, p := range x8Params {
+		p = cleanParam(p)
+		if p != "" && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "\\") && isValidParam(p) && !seen[p] {
+			if len(final) < maxParams {
+				seen[p] = true
+				final = append(final, p)
+			} else {
+				x8Dropped++
+			}
+		}
+	}
+
+	// 3. Finally Fallparams
+	fallDropped := 0
+	for _, p := range fallParams {
+		p = cleanParam(p)
+		if p != "" && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "\\") && isValidParam(p) && !seen[p] {
+			if len(final) < maxParams {
+				seen[p] = true
+				final = append(final, p)
+			} else {
+				fallDropped++
+			}
+		}
+	}
+
+	if x8Dropped > 0 || fallDropped > 0 {
+		msg := fmt.Sprintf("Max params (%d) reached for %s. Dropped %d x8 and %d fallparams.", maxParams, filepath.Base(outFile), x8Dropped, fallDropped)
+		printWarning(msg)
+	}
+
+	if len(final) == len(existing) {
 		return 0, nil
 	}
 
-	f, err := os.OpenFile(outFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+	f, err := os.Create(outFile)
 	if err != nil {
 		return 0, err
 	}
 	defer f.Close()
-	for _, p := range fresh {
+	for _, p := range final {
 		fmt.Fprintln(f, p)
 	}
-	return len(fresh), nil
+	return len(final) - len(existing), nil
 }
 
 // ─── Tool Check ────────────────────────────────────────────────────────────────
@@ -237,36 +268,51 @@ func runFallparams(ctx context.Context, rawURL string, silent bool) ([]string, e
 
 	runDir, err := os.MkdirTemp("", "fall_isolate_*")
 	if err != nil {
-		logErrorMsg(fmt.Sprintf("failed to create temp directory for fallparams: %v", err))
 		return nil, fmt.Errorf("failed to create temp directory for fallparams: %v", err)
 	}
 	registerTemp(runDir)
 
 	cmd := exec.CommandContext(ctx, "fallparams", "-u", rawURL)
-	cmd.Dir = runDir // Always set Dir to runDir for isolation
+	cmd.Dir = runDir
 
-	out, runErr := cmd.CombinedOutput()
-	if runErr != nil {
-		msg := fmt.Sprintf("fallparams returned non-zero: %v\nOutput: %s", runErr, string(out))
+	_, _ = cmd.CombinedOutput()
+	// Ignore runErr here as we check the output file
+
+	fallOutPath := filepath.Join(runDir, "parameters.txt")
+	content, err := os.ReadFile(fallOutPath)
+	if err != nil {
+		if !silent {
+			printInfo("fallparams: no output file found")
+		}
+		return nil, nil
+	}
+
+	var raw []string
+	sc := bufio.NewScanner(strings.NewReader(string(content)))
+	for sc.Scan() {
+		if t := strings.TrimSpace(sc.Text()); t != "" {
+			raw = append(raw, t)
+		}
+	}
+
+	if len(raw) >= 50 {
+		msg := fmt.Sprintf("fallparams output for %s discarded: volume gate exceeded (%d >= 50)", rawURL, len(raw))
 		if !silent {
 			printWarning(msg)
 		} else {
 			logErrorMsg(msg)
 		}
-		// Continue processing even if fallparams fails, it might still produce output
+		return nil, nil
 	}
 
 	var params []string
-	fallOutPath := filepath.Join(runDir, "parameters.txt")
-
-	if _, statErr := os.Stat(fallOutPath); statErr == nil {
-		readParamsResult, readParamsErr := readParams(fallOutPath)
-		if readParamsErr != nil {
-			logErrorMsg(fmt.Sprintf("failed to read fallparams output file %s: %v", fallOutPath, readParamsErr))
-		} else {
-			params = readParamsResult
+	seen := make(map[string]bool)
+	for _, p := range raw {
+		p = cleanParam(p)
+		if p != "" && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "\\") && isValidParam(p) && !seen[p] {
+			seen[p] = true
+			params = append(params, p)
 		}
-		os.Remove(fallOutPath)
 	}
 
 	if !silent {
@@ -287,7 +333,7 @@ func extractX8Params(content string) []string {
 
 	addParam := func(p string) {
 		p = cleanParam(p)
-		if p != "" && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "\\") && !seen[p] {
+		if p != "" && !strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "\\") && isValidParam(p) && !seen[p] {
 			seen[p] = true
 			out = append(out, p)
 		}
@@ -311,8 +357,6 @@ func extractX8Params(content string) []string {
 			continue
 		}
 
-		// This part seems to be for raw params in output, but might be too broad.
-		// Consider if this is intended to capture params not matched by regexes.
 		if !strings.ContainsAny(line, " [:]") {
 			addParam(line)
 		}
@@ -347,7 +391,6 @@ func runX8(ctx context.Context, rawURL, wordlist string, silent bool) ([]string,
 		} else {
 			logErrorMsg(msg)
 		}
-		// Continue processing even if x8 fails, it might still produce output
 	}
 
 	content, readErr := os.ReadFile(tmpFile)
@@ -370,10 +413,11 @@ func runX8(ctx context.Context, rawURL, wordlist string, silent bool) ([]string,
 // ─── URL Processor ─────────────────────────────────────────────────────────────
 
 type Result struct {
-	URL     string
-	OutFile string
-	Params  []string
-	Err     error
+	URL        string
+	OutFile    string
+	X8Params   []string
+	FallParams []string
+	Err        error
 }
 
 func processURL(ctx context.Context, rawURL string, cfg *Config) Result {
@@ -385,17 +429,9 @@ func processURL(ctx context.Context, rawURL string, cfg *Config) Result {
 	toolCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Timeout)*time.Second)
 	defer cancel()
 
-	var allParams []string
-	seen := make(map[string]bool)
-
-	add := func(params []string) {
-		for _, p := range params {
-			if !seen[p] {
-				seen[p] = true
-				allParams = append(allParams, p)
-			}
-		}
-	}
+	var res Result
+	res.URL = rawURL
+	res.OutFile = outFile
 
 	var fallErr, x8Err error
 
@@ -409,7 +445,7 @@ func processURL(ctx context.Context, rawURL string, cfg *Config) Result {
 				logErrorMsg(fallErr.Error())
 			}
 		} else {
-			add(params)
+			res.FallParams = params
 		}
 	}
 
@@ -423,21 +459,19 @@ func processURL(ctx context.Context, rawURL string, cfg *Config) Result {
 				logErrorMsg(x8Err.Error())
 			}
 		} else {
-			add(params)
+			res.X8Params = params
 		}
 	}
 
-	// Aggregate errors if both tools failed
-	var overallErr error
 	if fallErr != nil && x8Err != nil {
-		overallErr = fmt.Errorf("%v; %v", fallErr, x8Err)
+		res.Err = fmt.Errorf("%v; %v", fallErr, x8Err)
 	} else if fallErr != nil {
-		overallErr = fallErr
+		res.Err = fallErr
 	} else if x8Err != nil {
-		overallErr = x8Err
+		res.Err = x8Err
 	}
 
-	return Result{URL: rawURL, OutFile: outFile, Params: allParams, Err: overallErr}
+	return res
 }
 
 // ─── Multi-URL with worker pool ────────────────────────────────────────────────
@@ -457,7 +491,7 @@ func processURLFile(ctx context.Context, cfg *Config) error {
 			continue
 		}
 		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-			u = "https://" + u // Default to https if not specified
+			u = "https://" + u
 		}
 		urls = append(urls, u)
 	}
@@ -517,14 +551,14 @@ func processURLFile(ctx context.Context, cfg *Config) error {
 
 		atomic.AddInt64(&successCount, 1)
 
-		if len(res.Params) > 0 {
-			added, _ := writeHostParamFile(res.OutFile, res.Params)
+		if len(res.X8Params) > 0 || len(res.FallParams) > 0 {
+			added, _ := writeHostParamFile(res.OutFile, res.X8Params, res.FallParams, cfg.MaxParams)
 			atomic.AddInt64(&totalFound, int64(added))
 			if !cfg.Silent {
 				if added > 0 {
 					printSuccess(fmt.Sprintf("%d new unique params saved to %s", added, res.OutFile))
 				} else {
-					printInfo(fmt.Sprintf("Params found, but already existed in %s", res.OutFile))
+					printInfo(fmt.Sprintf("Params found, but already existed or cap reached in %s", res.OutFile))
 				}
 			}
 		} else if !cfg.Silent {
@@ -559,6 +593,7 @@ func main() {
 	flag.IntVar(&cfg.Timeout, "timeout", 300, "Per-tool timeout in seconds")
 	flag.BoolVar(&cfg.NoX8, "no-x8", false, "Skip x8 (fallparams only)")
 	flag.BoolVar(&cfg.NoFall, "no-fall", false, "Skip fallparams (x8 only)")
+	flag.IntVar(&cfg.MaxParams, "max-params", 200, "Maximum number of parameters to keep per host")
 
 	flag.Usage = func() {
 		printf("%sUsage:%s\n", PR_boldYellow, PR_reset)
@@ -641,12 +676,12 @@ func main() {
 			os.Exit(1)
 		}
 
-		if len(res.Params) > 0 {
-			added, _ := writeHostParamFile(res.OutFile, res.Params)
+		if len(res.X8Params) > 0 || len(res.FallParams) > 0 {
+			added, _ := writeHostParamFile(res.OutFile, res.X8Params, res.FallParams, cfg.MaxParams)
 			if !cfg.Silent {
 				printSep()
-				printSuccess(fmt.Sprintf("Found %d unique params (saved %d new to %s)", len(res.Params), added, res.OutFile))
-				printSuccess(fmt.Sprintf("Params: %s", strings.Join(res.Params, ", ")))
+				total := len(res.X8Params) + len(res.FallParams)
+				printSuccess(fmt.Sprintf("Found %d unique params (saved %d new to %s)", total, added, res.OutFile))
 			}
 		} else if !cfg.Silent {
 			printSep()
