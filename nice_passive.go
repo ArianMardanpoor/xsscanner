@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -17,6 +18,25 @@ const (
 	P_gray  = "\033[90m"
 	P_reset = "\033[0m"
 )
+
+var (
+	// FIX BUG2A: Add regexes for URL filtering
+	reNumeric     = regexp.MustCompile(`^\d+$`)
+	reSemver      = regexp.MustCompile(`^\d+\.\d+(\.\d+)?$`)
+	reCSSValue    = regexp.MustCompile(`^\d+(px|em|rem|vh|vw|ms|fr|%)$`)
+	reHighEntropy = regexp.MustCompile(`^[A-Za-z0-9_\-]{40,}$`)
+	reUpper       = regexp.MustCompile(`[A-Z]`)
+	reDigit       = regexp.MustCompile(`[0-9]`)
+	reLower       = regexp.MustCompile(`[a-z]`)
+)
+
+// FIX BUG2A: Helper for high entropy segments
+func isHighEntropySegment(s string) bool {
+	if len(s) < 40 {
+		return false
+	}
+	return reUpper.MatchString(s) && reDigit.MatchString(s) && reLower.MatchString(s)
+}
 
 func getHostname(rawURL string) string {
 	if strings.HasPrefix(rawURL, "http") {
@@ -29,6 +49,7 @@ func getHostname(rawURL string) string {
 }
 
 func isGoodURL(rawURL string) bool {
+	// FIX BUG2A: Upgrade isGoodURL with more robust filters
 	extensions := []string{".json", ".js", ".fnt", ".ogg", ".css", ".jpg", ".jpeg", ".png", ".svg", ".img", ".gif", ".exe", ".mp4", ".flv", ".pdf", ".doc", ".ogv", ".webm", ".wmv", ".webp", ".mov", ".mp3", ".m4a", ".m4p", ".ppt", ".pptx", ".scss", ".tif", ".tiff", ".ttf", ".otf", ".woff", ".woff2", ".bmp", ".ico", ".eot", ".htc", ".swf", ".rtf", ".image", ".rf", ".txt", ".xml", ".zip"}
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -40,6 +61,40 @@ func isGoodURL(rawURL string) bool {
 			return false
 		}
 	}
+
+	// NEW: reject pure numeric paths like /1, /404, /200
+	pathSegments := strings.Split(strings.Trim(path, "/"), "/")
+	if len(pathSegments) == 0 || (len(pathSegments) == 1 && pathSegments[0] == "") {
+		return true
+	}
+	lastSegment := pathSegments[len(pathSegments)-1]
+	if reNumeric.MatchString(lastSegment) {
+		return false
+	}
+
+	// NEW: reject semver-like paths like /1.8.3, /2.0.1
+	if reSemver.MatchString(lastSegment) {
+		return false
+	}
+
+	// NEW: reject paths that look like hostnames (contain dots, no slashes after)
+	// e.g. /sq.airbnb.com /archive.org_bot
+	if strings.Count(lastSegment, ".") >= 1 && len(pathSegments) <= 2 {
+		return false
+	}
+
+	// NEW: reject CSS-like values
+	if reCSSValue.MatchString(lastSegment) {
+		return false
+	}
+
+	// NEW: reject media chunk URLs (high-entropy token paths)
+	for _, seg := range pathSegments {
+		if isHighEntropySegment(seg) {
+			return false
+		}
+	}
+
 	return true
 }
 

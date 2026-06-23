@@ -28,6 +28,66 @@ const (
 )
 
 var (
+	// FIX BUG2B: Add regexes for URL filtering
+	reNumeric     = regexp.MustCompile(`^\d+$`)
+	reSemver      = regexp.MustCompile(`^\d+\.\d+(\.\d+)?$`)
+	reCSSValue    = regexp.MustCompile(`^\d+(px|em|rem|vh|vw|ms|fr|%)$`)
+	reHighEntropy = regexp.MustCompile(`^[A-Za-z0-9_\-]{40,}$`)
+	reUpper       = regexp.MustCompile(`[A-Z]`)
+	reDigit       = regexp.MustCompile(`[0-9]`)
+	reLower       = regexp.MustCompile(`[a-z]`)
+)
+
+// FIX BUG2B: Helper for high entropy segments
+func isHighEntropySegment(s string) bool {
+	if len(s) < 40 {
+		return false
+	}
+	return reUpper.MatchString(s) && reDigit.MatchString(s) && reLower.MatchString(s)
+}
+
+// FIX BUG2B: Duplicate isGoodURL for main.go
+func isGoodURL(rawURL string) bool {
+	extensions := []string{".json", ".js", ".fnt", ".ogg", ".css", ".jpg", ".jpeg", ".png", ".svg", ".img", ".gif", ".exe", ".mp4", ".flv", ".pdf", ".doc", ".ogv", ".webm", ".wmv", ".webp", ".mov", ".mp3", ".m4a", ".m4p", ".ppt", ".pptx", ".scss", ".tif", ".tiff", ".ttf", ".otf", ".woff", ".woff2", ".bmp", ".ico", ".eot", ".htc", ".swf", ".rtf", ".image", ".rf", ".txt", ".xml", ".zip"}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	path := strings.ToLower(parsed.Path)
+	for _, ext := range extensions {
+		if strings.HasSuffix(path, ext) {
+			return false
+		}
+	}
+
+	pathSegments := strings.Split(strings.Trim(path, "/"), "/")
+	if len(pathSegments) == 0 || (len(pathSegments) == 1 && pathSegments[0] == "") {
+		return true
+	}
+	lastSegment := pathSegments[len(pathSegments)-1]
+
+	if reNumeric.MatchString(lastSegment) {
+		return false
+	}
+	if reSemver.MatchString(lastSegment) {
+		return false
+	}
+	if strings.Count(lastSegment, ".") >= 1 && len(pathSegments) <= 2 {
+		return false
+	}
+	if reCSSValue.MatchString(lastSegment) {
+		return false
+	}
+	for _, seg := range pathSegments {
+		if isHighEntropySegment(seg) {
+			return false
+		}
+	}
+
+	return true
+}
+
+var (
 	apiURL          = "http://localhost:3131/api/http"
 	apiToken        = "a21uc0lzeTcK"
 	oldTargetsFile  = "all_scanned_targets.txt"
@@ -225,6 +285,9 @@ func processTarget(target string, isSingleTarget bool) {
 						} else {
 							continue
 						}
+					}
+					if !isGoodURL(line) { // FIX BUG2B: Add quality check
+						continue
 					}
 					f.WriteString(line + "\n")
 				}
