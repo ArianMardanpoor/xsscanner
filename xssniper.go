@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -574,6 +575,45 @@ func stripANSI(str string) string {
 	return reANSI.ReplaceAllString(str, "")
 }
 
+// FIX BUG1: Add this function to xssniper.go
+func isTargetAlive(targetURL string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+	// Strip fragment before HEAD check
+	u, err := url.Parse(targetURL)
+	if err != nil {
+		return false
+	}
+	u.Fragment = ""
+	checkURL := u.String()
+
+	req, _ := http.NewRequestWithContext(ctx, "HEAD", checkURL, nil)
+	resp, err := client.Do(req)
+
+	if err != nil || resp.StatusCode == 405 || resp.StatusCode == 403 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		reqGET, _ := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
+		resp, err = client.Do(reqGET)
+		if err != nil {
+			return false
+		}
+	}
+	defer resp.Body.Close()
+
+	return resp.StatusCode < 500
+}
+
 func runCommand(name string, args ...string) (string, error) {
 	if name == "nuclei" && !nucleiExists {
 		return "", nil
@@ -715,33 +755,50 @@ func processURL(targetURL string, index, total int) {
 	logLine("PHASE", X_cyan, "2/5 Canary Probing (DOM query params)...")
 
 	domQueryProbeFile := filepath.Join(outputDir, safe+"-dom-query-probe.txt")
+	paramsToProbe := []string{}
 	if paramFile != "" {
 		if pf, err := os.Open(paramFile); err == nil {
-			var domProbeURLs []string
 			scanner := bufio.NewScanner(pf)
 			for scanner.Scan() {
-				param := strings.TrimSpace(scanner.Text())
-				if param == "" {
-					continue
+				if p := strings.TrimSpace(scanner.Text()); p != "" {
+					paramsToProbe = append(paramsToProbe, p)
 				}
-				canary := "x9canary" + randomString(3)
-				u, err := url.Parse(targetURL)
-				if err != nil {
-					continue
-				}
-				q := u.Query()
-				q.Set(param, canary)
-				u.RawQuery = q.Encode()
-				domProbeURLs = append(domProbeURLs, u.String())
 			}
 			pf.Close()
-			if len(domProbeURLs) > 0 {
-				os.WriteFile(domQueryProbeFile, []byte(strings.Join(domProbeURLs, "\n")), 0644)
+		}
+	}
+	// FIX BUG5: fallback to a hardcoded set of high-value DOM params
+	if len(paramsToProbe) == 0 {
+		paramsToProbe = []string{
+			"q", "s", "search", "id", "url", "redirect", "next", "return",
+			"callback", "code", "token", "data", "input", "value", "text",
+			"name", "message", "template", "write", "timeout", "src", "frame",
+			"href", "goto", "dest", "destination", "target",
+		}
+	}
+
+	if len(paramsToProbe) > 0 {
+		var domProbeURLs []string
+		for _, param := range paramsToProbe {
+			canary := "x9canary" + randomString(3)
+			u, err := url.Parse(targetURL)
+			if err != nil {
+				continue
 			}
+			q := u.Query()
+			q.Set(param, canary)
+			u.RawQuery = q.Encode()
+			domProbeURLs = append(domProbeURLs, u.String())
+		}
+		if len(domProbeURLs) > 0 {
+			os.WriteFile(domQueryProbeFile, []byte(strings.Join(domProbeURLs, "\n")), 0644)
 		}
 	}
 	// Phase 3: Filter Vulnerable Parameters
 	logLine("PHASE", X_blue, "3/5 Filtering reflective parameters...")
+
+	targetAlive := isTargetAlive(targetURL) // FIX BUG1: Cache liveness status
+
 	probeFiles := map[string]string{
 		probeOutputBase + ".get":        "get",
 		probeOutputBase + ".json":       "json",
@@ -754,6 +811,11 @@ func processURL(targetURL string, index, total int) {
 	for pf, phase := range probeFiles {
 		if _, err := os.Stat(pf); err == nil {
 			if phase == "dom" {
+				if !targetAlive { // FIX BUG1: HTTP liveness pre-check
+					logLine("DEBUG", X_gray, "Target dead, skipping DOM canary for %s", targetURL)
+					continue
+				}
+
 				// Bug 3: Add enhanced debug logs for DOM canary
 				content, _ := os.ReadFile(pf)
 				lines := strings.Split(strings.TrimSpace(string(content)), "\n")
@@ -774,7 +836,10 @@ func processURL(targetURL string, index, total int) {
 					if res != "" {
 						lines := strings.Split(strings.TrimSpace(res), "\n")
 						for _, l := range lines {
-							if l != "" {
+							l = strings.TrimSpace(l)
+							// FIX BUG3: only add valid JSON dom sink outputs
+							var probe DomSinkOutput
+							if err := json.Unmarshal([]byte(l), &probe); err == nil && probe.URL != "" {
 								p3Findings["dom"] = append(p3Findings["dom"], l)
 							}
 						}
@@ -789,7 +854,9 @@ func processURL(targetURL string, index, total int) {
 
 	// Bug 1: Move DOM Query probe before triage and check
 	if _, err := os.Stat(domQueryProbeFile); err == nil {
-		if domSinkCheckerExists {
+		if !targetAlive { // FIX BUG1: HTTP liveness pre-check
+			logLine("DEBUG", X_gray, "Target dead, skipping DOM query probe for %s", targetURL)
+		} else if domSinkCheckerExists {
 			lineCount := countLines(domQueryProbeFile)
 			logLine("DEBUG", X_gray, "DOM Query probe file has %d lines", lineCount)
 
@@ -801,7 +868,10 @@ func processURL(targetURL string, index, total int) {
 			if res != "" {
 				lines := strings.Split(strings.TrimSpace(res), "\n")
 				for _, l := range lines {
-					if l != "" {
+					l = strings.TrimSpace(l)
+					// FIX BUG3: only add valid JSON dom sink outputs
+					var probe DomSinkOutput
+					if err := json.Unmarshal([]byte(l), &probe); err == nil && probe.URL != "" {
 						p3Findings["dom"] = append(p3Findings["dom"], l)
 					}
 				}
