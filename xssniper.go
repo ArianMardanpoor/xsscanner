@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -85,11 +87,30 @@ func (r *VulnerabilityReport) processDomJson(domOut DomSinkOutput, phase string)
 		return
 	}
 
+	if !isInScope(r.URL, domOut.URL) {
+		return
+	}
+
 	severity := "likely"
 	confirmed := false
+	note := ""
 	if phase == "dom_confirmed" {
 		severity = "confirmed"
 		confirmed = true
+
+		// BUG 1 Fix: Verify reflection in HTTP response body
+		canary := ""
+		if m := reX9.FindString(domOut.URL); m != "" {
+			canary = m
+		}
+		if canary != "" {
+			if !reflectionExists(domOut.URL, "GET", nil, "", canary) {
+				severity = "possible"
+				confirmed = false
+				note = " (Note: No HTTP reflection, possible false positive)"
+				logLine("DEBUG", X_yellow, "Downgrading DOM XSS for %s: No HTTP reflection", domOut.URL)
+			}
+		}
 	}
 
 	found := false
@@ -111,6 +132,9 @@ func (r *VulnerabilityReport) processDomJson(domOut DomSinkOutput, phase string)
 				logLine("DEBUG", X_gray, "Upgrading DOM param=%s from=%s to=%s", name, v.Severity, severity)
 				r.DOM[i].Severity = severity
 			}
+			if note != "" && !strings.Contains(r.DOM[i].Name, note) {
+				r.DOM[i].Name += note
+			}
 			if confirmed {
 				r.DOM[i].Confirmed = true
 			}
@@ -120,7 +144,7 @@ func (r *VulnerabilityReport) processDomJson(domOut DomSinkOutput, phase string)
 	}
 	if !found {
 		r.DOM = append(r.DOM, Vulnerability{
-			Name:      name,
+			Name:      name + note,
 			Severity:  severity,
 			Confirmed: confirmed,
 			Payloads:  domOut.Sinks,
@@ -172,6 +196,10 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 		}
 
 		if rawURL == "" {
+			continue
+		}
+
+		if !isInScope(r.URL, rawURL) {
 			continue
 		}
 
@@ -247,6 +275,7 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 		}
 
 		severity := "possible"
+		note := ""
 		if phase == "get" {
 			severity = "likely"
 		} else if phase == "dom" {
@@ -254,6 +283,19 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 		} else if phase == "dom_confirmed" {
 			severity = "confirmed"
 			phase = "dom"
+
+			// BUG 1 Fix for legacy nuclei-style line parsing
+			canary := ""
+			if m := reX9.FindString(rawURL); m != "" {
+				canary = m
+			}
+			if canary != "" {
+				if !reflectionExists(targetURL, "GET", nil, "", canary) {
+					severity = "possible"
+					note = " (Note: No HTTP reflection, possible false positive)"
+					logLine("DEBUG", X_yellow, "Downgrading DOM XSS for %s: No HTTP reflection", targetURL)
+				}
+			}
 		} else if phase == "header" || phase == "json" {
 			canary := ""
 			if m := reX9.FindString(injection); m != "" {
@@ -297,12 +339,15 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 					logLine("DEBUG", X_gray, "Upgrading DOM param=%s from=%s to=%s", name, (*targetList)[i].Severity, severity)
 					(*targetList)[i].Severity = severity
 				}
+				if note != "" && !strings.Contains((*targetList)[i].Name, note) {
+					(*targetList)[i].Name += note
+				}
 				found = true
 				break
 			}
 		}
 		if !found {
-			newVuln := Vulnerability{Name: name, Severity: severity}
+			newVuln := Vulnerability{Name: name + note, Severity: severity}
 			if payload != "" {
 				newVuln.Payloads = []string{payload}
 			}
@@ -545,6 +590,8 @@ var (
 	mu                   sync.Mutex
 	tg                   *Telegram
 	allCrawledURLs       []string
+	maxURLsPerTarget     int
+	allowWildcards       bool
 	processedTargets     int64
 	vulnerableTargets    int64
 	vulnerableMap        sync.Map
@@ -572,6 +619,101 @@ func min(a, b int) int {
 
 func stripANSI(str string) string {
 	return reANSI.ReplaceAllString(str, "")
+}
+
+func extractRootDomain(hostname string) string {
+	parts := strings.Split(hostname, ".")
+	if len(parts) <= 2 {
+		return hostname
+	}
+	return strings.Join(parts[len(parts)-2:], ".")
+}
+
+func isInScope(targetURL, rawURL string) bool {
+	tParsed, errT := url.Parse(targetURL)
+	uParsed, errU := url.Parse(rawURL)
+	if errT != nil || errU != nil {
+		return false
+	}
+
+	rootDomain := extractRootDomain(tParsed.Hostname())
+	urlDomain := uParsed.Hostname()
+
+	return urlDomain == rootDomain || strings.HasSuffix(urlDomain, "."+rootDomain)
+}
+
+func isConcreteURL(rawURL string) bool {
+	if allowWildcards {
+		return true
+	}
+	decoded, _ := url.QueryUnescape(rawURL)
+	if strings.Contains(decoded, "*") {
+		return false
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	for _, seg := range strings.Split(parsed.Path, "/") {
+		decoded, _ := url.QueryUnescape(seg)
+		if decoded == "*" {
+			return false
+		}
+	}
+	return true
+}
+
+// FIX BUG6: Optimized liveness check
+func isTargetAlive(targetURL string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+	// Strip fragment before HEAD check
+	u, err := url.Parse(targetURL)
+	if err != nil {
+		return false
+	}
+	u.Fragment = ""
+	checkURL := u.String()
+
+	req, _ := http.NewRequestWithContext(ctx, "HEAD", checkURL, nil)
+	resp, err := client.Do(req)
+
+	if err != nil {
+		// Connection error - retry GET with shorter timeout
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel2()
+		reqGET, _ := http.NewRequestWithContext(ctx2, "GET", checkURL, nil)
+		resp, err = client.Do(reqGET)
+		if err != nil {
+			return false
+		}
+	} else {
+		defer resp.Body.Close()
+		if resp.StatusCode < 400 || resp.StatusCode == 401 || resp.StatusCode == 403 {
+			return true
+		}
+		if resp.StatusCode >= 404 && resp.StatusCode != 405 {
+			return false // Definitely dead
+		}
+		// 405 Method Not Allowed - retry with GET
+		reqGET, _ := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
+		resp, err = client.Do(reqGET)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+	}
+
+	return resp.StatusCode < 500
 }
 
 func runCommand(name string, args ...string) (string, error) {
@@ -715,33 +857,50 @@ func processURL(targetURL string, index, total int) {
 	logLine("PHASE", X_cyan, "2/5 Canary Probing (DOM query params)...")
 
 	domQueryProbeFile := filepath.Join(outputDir, safe+"-dom-query-probe.txt")
+	paramsToProbe := []string{}
 	if paramFile != "" {
 		if pf, err := os.Open(paramFile); err == nil {
-			var domProbeURLs []string
 			scanner := bufio.NewScanner(pf)
 			for scanner.Scan() {
-				param := strings.TrimSpace(scanner.Text())
-				if param == "" {
-					continue
+				if p := strings.TrimSpace(scanner.Text()); p != "" {
+					paramsToProbe = append(paramsToProbe, p)
 				}
-				canary := "x9canary" + randomString(3)
-				u, err := url.Parse(targetURL)
-				if err != nil {
-					continue
-				}
-				q := u.Query()
-				q.Set(param, canary)
-				u.RawQuery = q.Encode()
-				domProbeURLs = append(domProbeURLs, u.String())
 			}
 			pf.Close()
-			if len(domProbeURLs) > 0 {
-				os.WriteFile(domQueryProbeFile, []byte(strings.Join(domProbeURLs, "\n")), 0644)
+		}
+	}
+	// FIX BUG5: fallback to a hardcoded set of high-value DOM params
+	if len(paramsToProbe) == 0 {
+		paramsToProbe = []string{
+			"q", "s", "search", "id", "url", "redirect", "next", "return",
+			"callback", "code", "token", "data", "input", "value", "text",
+			"name", "message", "template", "write", "timeout", "src", "frame",
+			"href", "goto", "dest", "destination", "target",
+		}
+	}
+
+	if len(paramsToProbe) > 0 {
+		var domProbeURLs []string
+		for _, param := range paramsToProbe {
+			canary := "x9canary" + randomString(3)
+			u, err := url.Parse(targetURL)
+			if err != nil {
+				continue
 			}
+			q := u.Query()
+			q.Set(param, canary)
+			u.RawQuery = q.Encode()
+			domProbeURLs = append(domProbeURLs, u.String())
+		}
+		if len(domProbeURLs) > 0 {
+			os.WriteFile(domQueryProbeFile, []byte(strings.Join(domProbeURLs, "\n")), 0644)
 		}
 	}
 	// Phase 3: Filter Vulnerable Parameters
 	logLine("PHASE", X_blue, "3/5 Filtering reflective parameters...")
+
+	targetAlive := isTargetAlive(targetURL) // FIX BUG1: Cache liveness status
+
 	probeFiles := map[string]string{
 		probeOutputBase + ".get":        "get",
 		probeOutputBase + ".json":       "json",
@@ -754,6 +913,11 @@ func processURL(targetURL string, index, total int) {
 	for pf, phase := range probeFiles {
 		if _, err := os.Stat(pf); err == nil {
 			if phase == "dom" {
+				if !targetAlive { // FIX BUG1: HTTP liveness pre-check
+					logLine("DEBUG", X_gray, "Target dead, skipping DOM canary for %s", targetURL)
+					continue
+				}
+
 				// Bug 3: Add enhanced debug logs for DOM canary
 				content, _ := os.ReadFile(pf)
 				lines := strings.Split(strings.TrimSpace(string(content)), "\n")
@@ -774,7 +938,10 @@ func processURL(targetURL string, index, total int) {
 					if res != "" {
 						lines := strings.Split(strings.TrimSpace(res), "\n")
 						for _, l := range lines {
-							if l != "" {
+							l = strings.TrimSpace(l)
+							// FIX BUG3: only add valid JSON dom sink outputs
+							var probe DomSinkOutput
+							if err := json.Unmarshal([]byte(l), &probe); err == nil && probe.URL != "" {
 								p3Findings["dom"] = append(p3Findings["dom"], l)
 							}
 						}
@@ -789,7 +956,9 @@ func processURL(targetURL string, index, total int) {
 
 	// Bug 1: Move DOM Query probe before triage and check
 	if _, err := os.Stat(domQueryProbeFile); err == nil {
-		if domSinkCheckerExists {
+		if !targetAlive { // FIX BUG1: HTTP liveness pre-check
+			logLine("DEBUG", X_gray, "Target dead, skipping DOM query probe for %s", targetURL)
+		} else if domSinkCheckerExists {
 			lineCount := countLines(domQueryProbeFile)
 			logLine("DEBUG", X_gray, "DOM Query probe file has %d lines", lineCount)
 
@@ -801,7 +970,10 @@ func processURL(targetURL string, index, total int) {
 			if res != "" {
 				lines := strings.Split(strings.TrimSpace(res), "\n")
 				for _, l := range lines {
-					if l != "" {
+					l = strings.TrimSpace(l)
+					// FIX BUG3: only add valid JSON dom sink outputs
+					var probe DomSinkOutput
+					if err := json.Unmarshal([]byte(l), &probe); err == nil && probe.URL != "" {
 						p3Findings["dom"] = append(p3Findings["dom"], l)
 					}
 				}
@@ -898,7 +1070,7 @@ func processURL(targetURL string, index, total int) {
 					break
 				}
 			}
-			if !isConfirmed {
+			if !isConfirmed && isInScope(targetURL, u) && isConcreteURL(u) {
 				httpAtkUrls = append(httpAtkUrls, u)
 			}
 		}
@@ -926,7 +1098,7 @@ func processURL(targetURL string, index, total int) {
 			continue
 		}
 		parsed, err := url.Parse(domOut.URL)
-		if err == nil && parsed.Fragment != "" {
+		if err == nil && parsed.Fragment != "" && isInScope(targetURL, domOut.URL) && isConcreteURL(domOut.URL) {
 			fragmentURLs = append(fragmentURLs, domOut.URL)
 		}
 	}
@@ -959,7 +1131,7 @@ func processURL(targetURL string, index, total int) {
 			continue
 		}
 		parsed, err := url.Parse(domOut.URL)
-		if err == nil && parsed.Fragment == "" {
+		if err == nil && parsed.Fragment == "" && isInScope(targetURL, domOut.URL) && isConcreteURL(domOut.URL) {
 			domQueryURLs = append(domQueryURLs, domOut.URL)
 		}
 	}
@@ -1038,6 +1210,8 @@ func main() {
 	flag.StringVar(&paramFile, "p", "", "Parameter file")
 	flag.IntVar(&concurrency, "c", 10, "x9 concurrency")
 	flag.IntVar(&workers, "w", 3, "Parallel workers")
+	flag.IntVar(&maxURLsPerTarget, "max-urls", 50, "Max URLs per target")
+	flag.BoolVar(&allowWildcards, "allow-wildcards", false, "Allow wildcard URLs")
 	flag.Parse()
 
 	if _, err := exec.LookPath("nuclei"); err == nil {
@@ -1086,6 +1260,46 @@ func main() {
 	}
 
 	urls = uniqueStrings(urls)
+
+	var concreteURLs []string
+	for _, u := range urls {
+		if isConcreteURL(u) {
+			concreteURLs = append(concreteURLs, u)
+		}
+	}
+	urls = concreteURLs
+
+	// Group by root domain for capping
+	groups := make(map[string][]string)
+	for _, u := range urls {
+		parsed, err := url.Parse(u)
+		if err != nil {
+			continue
+		}
+		root := extractRootDomain(parsed.Hostname())
+		groups[root] = append(groups[root], u)
+	}
+
+	var finalURLs []string
+	for _, groupUrls := range groups {
+		// Sort: URLs with query params first, then by path length (shorter first)
+		sort.Slice(groupUrls, func(i, j int) bool {
+			pi, _ := url.Parse(groupUrls[i])
+			pj, _ := url.Parse(groupUrls[j])
+			hasQi := pi != nil && len(pi.RawQuery) > 0
+			hasQj := pj != nil && len(pj.RawQuery) > 0
+			if hasQi != hasQj {
+				return hasQi // URLs with params come first
+			}
+			return len(groupUrls[i]) < len(groupUrls[j])
+		})
+
+		if maxURLsPerTarget > 0 && len(groupUrls) > maxURLsPerTarget {
+			groupUrls = groupUrls[:maxURLsPerTarget]
+		}
+		finalURLs = append(finalURLs, groupUrls...)
+	}
+	urls = finalURLs
 
 	if *singleURL != "" {
 		uTarget, _ := url.Parse(*singleURL)
