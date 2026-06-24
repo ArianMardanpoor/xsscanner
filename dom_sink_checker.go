@@ -95,13 +95,22 @@ type DomSinkOutput struct {
 	Sinks []string `json:"sinks"`
 }
 
+func safeClose(page *rod.Page) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] page close recovered: %v\n", r)
+		}
+	}()
+	page.MustClose()
+}
+
 func checkURL(browser *rod.Browser, targetURL, hookCode string, timeout int) {
 	page, err := browser.Page(proto.TargetCreateTarget{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[ERROR] could not create page: %v\n", err)
 		return
 	}
-	defer page.MustClose()
+	defer safeClose(page)
 
 	if _, err := page.EvalOnNewDocument(hookCode); err != nil {
 		fmt.Fprintf(os.Stderr, "[ERROR] EvalOnNewDocument failed: %v\n", err)
@@ -178,7 +187,16 @@ func main() {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line != "" && strings.HasPrefix(line, "http") {
-			checkURL(browser, line, hookCode, *timeout)
+			safeCheckURL(browser, line, hookCode, *timeout)
 		}
 	}
+}
+
+func safeCheckURL(browser *rod.Browser, targetURL, hookCode string, timeout int) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] checkURL panic for %s: %v\n", targetURL, r)
+		}
+	}()
+	checkURL(browser, targetURL, hookCode, timeout)
 }
