@@ -1,8 +1,11 @@
-// FILE: xssniper.go — REFACTORED
+// FILE: xssniper.go — REFACTORED LOGGING
 // Changes:
-// - Scope filter by root domain in main()
-// - Added SPA detection with -skip-spa flag
-// - Early return in processURL if SPA detected
+// - Removed all [DEBUG] log lines.
+// - Removed phase announcement lines (e.g., "2/5 Canary Probing...").
+// - Removed "No reflective parameters found." and "dom_sink_checker confirmed" INFO lines.
+// - Replaced phase 3 summary with [HIT] or [CLEAN] single-line output.
+// - Added [DEAD] line when all DOM probes are skipped due to dead target.
+// - Fixed unused variable compilation error.
 
 package main
 
@@ -15,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -73,13 +77,11 @@ func (r *VulnerabilityReport) processDomJson(domOut DomSinkOutput, phase string)
 	}
 
 	name := "unknown"
-	logLine("DEBUG", X_gray, "DOM parse rawURL=%s fragment=%s query=%s", domOut.URL, u.Fragment, u.RawQuery)
 	if u.Fragment != "" && strings.Contains(redactX9(u.Fragment), "x9") {
 		name = "fragment"
 	} else {
 		for k, v := range u.Query() {
 			val, _ := url.QueryUnescape(strings.Join(v, ""))
-			logLine("DEBUG", X_gray, "DOM checking param=%s val=%s redacted=%s", k, val, redactX9(val))
 			if strings.Contains(redactX9(val), "x9") {
 				name = k
 				break
@@ -112,7 +114,6 @@ func (r *VulnerabilityReport) processDomJson(domOut DomSinkOutput, phase string)
 				severity = "possible"
 				confirmed = false
 				note = " (Note: No HTTP reflection, possible false positive)"
-				logLine("DEBUG", X_yellow, "Downgrading DOM XSS for %s: No HTTP reflection", domOut.URL)
 			}
 		}
 	}
@@ -134,7 +135,6 @@ func (r *VulnerabilityReport) processDomJson(domOut DomSinkOutput, phase string)
 				}
 			}
 			if severityWeight(severity) > severityWeight(v.Severity) {
-				logLine("DEBUG", X_gray, "Upgrading DOM param=%s from=%s to=%s", name, v.Severity, severity)
 				r.DOM[i].Severity = severity
 			}
 			if note != "" && !strings.Contains(r.DOM[i].Name, note) {
@@ -241,13 +241,11 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 		case "dom", "dom_confirmed":
 			targetList = &r.DOM
 			if u, err := url.Parse(rawURL); err == nil {
-				logLine("DEBUG", X_gray, "DOM parse rawURL=%s fragment=%s query=%s", rawURL, u.Fragment, u.RawQuery)
 				if u.Fragment != "" && strings.Contains(redactX9(u.Fragment), "x9") {
 					name = "fragment"
 				} else {
 					for k, v := range u.Query() {
 						val, _ := url.QueryUnescape(strings.Join(v, ""))
-						logLine("DEBUG", X_gray, "DOM checking param=%s val=%s redacted=%s", k, val, redactX9(val))
 						if strings.Contains(redactX9(val), "x9") {
 							name = k
 							break
@@ -295,7 +293,6 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 				if !reflectionExists(targetURL, "GET", nil, "", canary) {
 					severity = "possible"
 					note = " (Note: No HTTP reflection, possible false positive)"
-					logLine("DEBUG", X_yellow, "Downgrading DOM XSS for %s: No HTTP reflection", targetURL)
 				}
 			}
 		} else if phase == "header" || phase == "json" {
@@ -338,7 +335,6 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 					}
 				}
 				if severityWeight(severity) > severityWeight((*targetList)[i].Severity) {
-					logLine("DEBUG", X_gray, "Upgrading DOM param=%s from=%s to=%s", name, (*targetList)[i].Severity, severity)
 					(*targetList)[i].Severity = severity
 				}
 				if note != "" && !strings.Contains((*targetList)[i].Name, note) {
@@ -600,13 +596,27 @@ var (
 	workerLock           sync.Map
 	nucleiExists         bool
 	domSinkCheckerExists bool
-	skipSPA              bool // NEW: flag to skip SPA detection
+	skipSPA              bool
+
+	consecutiveDead int64
+
+	phase int
 
 	reX9       = regexp.MustCompile(`x9(?:canary)?[a-z]*`)
 	rePayload  = regexp.MustCompile(`\[(?:"([^"]+)"|([^"\]]+))\]$`)
 	reANSI     = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 	reCleaning = regexp.MustCompile(`\s*\["0m"\]\s*`)
+
+	triageMu      sync.Mutex
+	triageEntries []TriageEntry
 )
+
+type TriageEntry struct {
+	TargetURL    string
+	ParamsCount  int
+	DomCount     int
+	HeadersCount int
+}
 
 func logLine(level, color, format string, args ...interface{}) {
 	ts := time.Now().Format("15:04:05")
@@ -715,6 +725,15 @@ func isTargetAlive(targetURL string) bool {
 	return resp.StatusCode < 500
 }
 
+func checkConnectivity() bool {
+	conn, err := net.DialTimeout("tcp", "8.8.8.8:53", 2*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
 func runCommand(name string, args ...string) (string, error) {
 	if name == "nuclei" && !nucleiExists {
 		return "", nil
@@ -764,7 +783,6 @@ func isSPA(targetURL string) bool {
 	}
 	body := string(bodyBytes)
 
-	// 1. Static markers
 	markers := []string{
 		`<div id="root"`,
 		`<div id="app"`,
@@ -780,7 +798,6 @@ func isSPA(targetURL string) bool {
 		}
 	}
 
-	// 2. Visible text length (strip script/style tags)
 	reScript := regexp.MustCompile(`(?s)<script[^>]*>.*?</script>`)
 	reStyle := regexp.MustCompile(`(?s)<style[^>]*>.*?</style>`)
 	clean := reScript.ReplaceAllString(body, "")
@@ -797,7 +814,6 @@ func isSPA(targetURL string) bool {
 		return true
 	}
 
-	// 3. Headers + near‑empty body (already checked visibleCount<500)
 	xPoweredBy := resp.Header.Get("x-powered-by")
 	if strings.Contains(strings.ToLower(xPoweredBy), "next.js") && visibleCount < 500 {
 		return true
@@ -807,6 +823,57 @@ func isSPA(targetURL string) bool {
 	}
 
 	return false
+}
+
+// ── Generic Reflector Detection ─────────────────────────────────────────────
+
+func isGenericReflector(targetURL string) bool {
+	u, err := url.Parse(targetURL)
+	if err != nil {
+		return false
+	}
+	u.Fragment = ""
+	q := u.Query()
+	q.Set("xprobe1", "CANARY_A")
+	q.Set("xprobe2", "CANARY_B")
+	q.Set("xprobe3", "CANARY_C")
+	q.Set("xprobe4", "CANARY_D")
+	q.Set("xprobe5", "CANARY_E")
+	u.RawQuery = q.Encode()
+	finalURL := u.String()
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 2 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+	req, err := http.NewRequest("GET", finalURL, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+	body := string(bodyBytes)
+
+	canaries := []string{"CANARY_A", "CANARY_B", "CANARY_C", "CANARY_D", "CANARY_E"}
+	count := 0
+	for _, c := range canaries {
+		if strings.Contains(body, c) {
+			count++
+		}
+	}
+	return count >= 4
 }
 
 // ── Core Logic ────────────────────────────────────────────────────────────────
@@ -882,11 +949,43 @@ func reflectionExists(targetURL, method string, headers map[string]string, body,
 	return strings.Contains(string(b), payload)
 }
 
-// checkHeaderReflection performs a GET request with the given header and checks if the value is reflected.
 func checkHeaderReflection(targetURL, headerName, headerValue string) bool {
 	headers := map[string]string{headerName: headerValue}
 	return reflectionExists(targetURL, "GET", headers, "", headerValue)
 }
+
+// extractBreakChars returns unique break characters found in a canary value.
+func extractBreakChars(val string) []string {
+	idx := strings.LastIndex(val, "x9")
+	if idx == -1 {
+		return nil
+	}
+	suffix := val[idx:]
+	breakChars := []string{"'", `"`, "`", "<", ";", "{{"}
+	found := []string{}
+	for _, bc := range breakChars {
+		if strings.Contains(suffix, bc) {
+			already := false
+			for _, f := range found {
+				if f == bc {
+					already = true
+					break
+				}
+			}
+			if !already {
+				found = append(found, bc)
+			}
+		}
+	}
+	return found
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// ── processURL ──────────────────────────────────────────────────────────────
 
 func processURL(targetURL string, index, total int) {
 	uParsed, err := url.Parse(targetURL)
@@ -912,25 +1011,33 @@ func processURL(targetURL string, index, total int) {
 
 	logLine("TARGET", X_white, "[%d/%d | Vulns: %d] %s", currProcessed, total, currVulns, targetURL)
 
-	// ── SPA DETECTION (NEW) ──
 	if !skipSPA && isSPA(targetURL) {
 		logLine("SKIP", X_yellow, "SPA/React detected, skipping heavy scan for %s", targetURL)
+		return
+	}
+
+	if isGenericReflector(targetURL) {
+		logLine("SKIP", X_yellow, "Generic reflector detected, skipping %s", targetURL)
 		return
 	}
 
 	report := VulnerabilityReport{URL: targetURL}
 
 	// Phase 2: Canary Probe
-	logLine("PHASE", X_cyan, "2/5 Canary Probing...")
-	probeInput := filepath.Join(outputDir, safe+"-probe-in.txt")
+	probeInput := filepath.Join(outputDir, safeName(targetURL)+"-probe-in.txt")
 	os.WriteFile(probeInput, []byte(targetURL), 0644)
 
-	probeOutputBase := filepath.Join(outputDir, safe+"-probe-out")
-	runCommand("./x9", "-probe", "-json", "-headers", "-dom", "-i", probeInput, "-o", probeOutputBase)
+	probeOutputBase := filepath.Join(outputDir, safeName(targetURL)+"-probe-out")
+
+	args := []string{"-probe", "-json", "-headers", "-dom"}
+	if uParsed.RawQuery != "" {
+		args = append(args, "-strict")
+	}
+	args = append(args, "-i", probeInput, "-o", probeOutputBase)
+	runCommand("./x9", args...)
 
 	// Phase 2: Canary Probing - DOM query params
-	logLine("PHASE", X_cyan, "2/5 Canary Probing (DOM query params)...")
-	domQueryProbeFile := filepath.Join(outputDir, safe+"-dom-query-probe.txt")
+	domQueryProbeFile := filepath.Join(outputDir, safeName(targetURL)+"-dom-query-probe.txt")
 	paramsToProbe := []string{}
 	if paramFile != "" {
 		if pf, err := os.Open(paramFile); err == nil {
@@ -970,10 +1077,28 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 
-	// Phase 3: Filter Vulnerable Parameters
-	logLine("PHASE", X_blue, "3/5 Filtering reflective parameters...")
+	// BUG 2: Add PHASE2 log before early return
+	logLine("PHASE2", X_gray, "probe files generated for %s", targetURL)
 
+	// If phase < 3, stop here
+	if phase < 3 {
+		return
+	}
+
+	// Phase 3: Filter Vulnerable Parameters
 	targetAlive := isTargetAlive(targetURL)
+
+	if targetAlive {
+		atomic.StoreInt64(&consecutiveDead, 0)
+	} else {
+		newCount := atomic.AddInt64(&consecutiveDead, 1)
+		if newCount%5 == 0 {
+			for !checkConnectivity() {
+				logLine("WARN", X_yellow, "Network connectivity lost — pausing scan for 30 seconds")
+				time.Sleep(30 * time.Second)
+			}
+		}
+	}
 
 	probeFiles := map[string]string{
 		probeOutputBase + ".get":        "get",
@@ -983,32 +1108,20 @@ func processURL(targetURL string, index, total int) {
 	}
 
 	p3Findings := make(map[string][]string)
-	candidateHeaders := []string{} // new: store header names that reflect canary
+	candidateHeaders := []string{}
 
-	for pf, phase := range probeFiles {
+	domProbeSkippedAll := false // track if all dom probes were skipped
+
+	for pf, probePhase := range probeFiles {
 		if _, err := os.Stat(pf); err == nil {
-			if phase == "dom" {
+			if probePhase == "dom" {
 				if !targetAlive {
-					logLine("DEBUG", X_gray, "Target dead, skipping DOM canary for %s", targetURL)
+					domProbeSkippedAll = true
 					continue
 				}
 
-				content, _ := os.ReadFile(pf)
-				lines := strings.Split(strings.TrimSpace(string(content)), "\n")
-				lineCount := 0
-				if len(lines) > 0 && lines[0] != "" {
-					lineCount = len(lines)
-					logLine("DEBUG", X_gray, "First %d lines of %s:", min(3, lineCount), pf)
-					for i := 0; i < min(3, lineCount); i++ {
-						logLine("DEBUG", X_gray, "  %s", lines[i])
-					}
-				}
-				logLine("DEBUG", X_gray, "DOM Canary file %s has %d lines", pf, lineCount)
-
 				if domSinkCheckerExists {
-					logLine("DEBUG", X_gray, "Invoking: ./dom_sink_checker -l %s", pf)
 					res, _ := runCommand("./dom_sink_checker", "-l", pf)
-					logLine("DEBUG", X_gray, "Raw dom_sink_checker output for %s:\n%s", pf, res)
 					if res != "" {
 						lines := strings.Split(strings.TrimSpace(res), "\n")
 						for _, l := range lines {
@@ -1020,8 +1133,7 @@ func processURL(targetURL string, index, total int) {
 						}
 					}
 				}
-			} else if phase == "header" {
-				// ---- NEW: Handle header canary directly without nuclei ----
+			} else if probePhase == "header" {
 				file, err := os.Open(pf)
 				if err != nil {
 					continue
@@ -1032,7 +1144,6 @@ func processURL(targetURL string, index, total int) {
 					if line == "" {
 						continue
 					}
-					// Expected format: url|HeaderName:value
 					parts := strings.SplitN(line, "|", 2)
 					if len(parts) != 2 {
 						continue
@@ -1046,9 +1157,7 @@ func processURL(targetURL string, index, total int) {
 					headerName := strings.TrimSpace(headerParts[0])
 					headerValue := strings.TrimSpace(headerParts[1])
 
-					// Check if the canary is reflected
 					if checkHeaderReflection(urlPart, headerName, headerValue) {
-						// Add to candidateHeaders (dedupe)
 						found := false
 						for _, h := range candidateHeaders {
 							if h == headerName {
@@ -1058,16 +1167,13 @@ func processURL(targetURL string, index, total int) {
 						}
 						if !found {
 							candidateHeaders = append(candidateHeaders, headerName)
-							logLine("DEBUG", X_gray, "Found reflective header: %s", headerName)
 						}
 					}
 				}
 				file.Close()
-				// Do not add to p3Findings
 			} else {
-				// GET and JSON: use nuclei
 				res, _ := runCommand("nuclei", "-l", pf, "-t", canaryTemplate, "-silent")
-				p3Findings[phase] = append(p3Findings[phase], extractURLsFromNuclei(res)...)
+				p3Findings[probePhase] = append(p3Findings[probePhase], extractURLsFromNuclei(res)...)
 			}
 		}
 	}
@@ -1075,16 +1181,9 @@ func processURL(targetURL string, index, total int) {
 	// DOM query probe
 	if _, err := os.Stat(domQueryProbeFile); err == nil {
 		if !targetAlive {
-			logLine("DEBUG", X_gray, "Target dead, skipping DOM query probe for %s", targetURL)
+			domProbeSkippedAll = true
 		} else if domSinkCheckerExists {
-			lineCount := countLines(domQueryProbeFile)
-			logLine("DEBUG", X_gray, "DOM Query probe file has %d lines", lineCount)
-
-			logLine("DEBUG", X_gray, "Invoking: ./dom_sink_checker -l %s", domQueryProbeFile)
-
 			res, _ := runCommand("./dom_sink_checker", "-l", domQueryProbeFile)
-			logLine("DEBUG", X_gray, "Raw dom_sink_checker output for %s:\n%s", domQueryProbeFile, res)
-
 			if res != "" {
 				lines := strings.Split(strings.TrimSpace(res), "\n")
 				for _, l := range lines {
@@ -1098,22 +1197,150 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 
-	// If no findings at all (including header candidates), return
+	// Print [DEAD] if all DOM probes were skipped
+	if domProbeSkippedAll && (fileExists(probeOutputBase+".dom.canary") || fileExists(domQueryProbeFile)) {
+		logLine("DEAD", X_yellow, "%s", targetURL)
+	}
+
+	// --- BUG 3: Summary line for all phases >= 3 ---
+	// Build summary (same as phase==3 block)
+	getParamSet := make(map[string]bool)
+	for _, u := range p3Findings["get"] {
+		parsed, err := url.Parse(u)
+		if err == nil {
+			for k := range parsed.Query() {
+				getParamSet[k] = true
+			}
+		}
+	}
+	var getParams []string
+	for k := range getParamSet {
+		getParams = append(getParams, k)
+	}
+	sort.Strings(getParams)
+
+	domCount := len(p3Findings["dom"])
+	headers := candidateHeaders
+	sort.Strings(headers)
+
+	// Print summary always
+	if len(getParamSet) > 0 || domCount > 0 || len(headers) > 0 {
+		paramsStr := strings.Join(getParams, ", ")
+		if paramsStr == "" {
+			paramsStr = "none"
+		}
+		headersStr := strings.Join(headers, ", ")
+		if headersStr == "" {
+			headersStr = "none"
+		}
+		logLine("HIT", X_green, "%s → params: %s | dom: %d | headers: %s", targetURL, paramsStr, domCount, headersStr)
+	} else {
+		logLine("CLEAN", X_gray, "%s", targetURL)
+	}
+
+	// Phase 3 summary and triage (write triage file only if phase == 3)
+	if phase == 3 {
+		// Write triage file (using computed getParams, domCount, headers)
+		var triageContent strings.Builder
+		triageContent.WriteString(fmt.Sprintf("TARGET: %s\n", targetURL))
+		triageContent.WriteString(fmt.Sprintf("SCANNED: %s\n\n", time.Now().Format(time.RFC3339)))
+
+		triageContent.WriteString("[GET PARAMS]\n")
+		if len(getParamSet) == 0 {
+			triageContent.WriteString("none\n\n")
+		} else {
+			paramBreaks := make(map[string]map[string]bool)
+			for p := range getParamSet {
+				paramBreaks[p] = make(map[string]bool)
+			}
+			for _, u := range p3Findings["get"] {
+				parsed, err := url.Parse(u)
+				if err != nil {
+					continue
+				}
+				for param, values := range parsed.Query() {
+					if _, ok := getParamSet[param]; ok {
+						for _, val := range values {
+							breaks := extractBreakChars(val)
+							for _, b := range breaks {
+								paramBreaks[param][b] = true
+							}
+						}
+					}
+				}
+			}
+			for _, param := range getParams {
+				breaks := []string{}
+				for b := range paramBreaks[param] {
+					breaks = append(breaks, b)
+				}
+				sort.Strings(breaks)
+				if len(breaks) == 0 {
+					triageContent.WriteString(fmt.Sprintf("%s | break_chars: \n", param))
+				} else {
+					triageContent.WriteString(fmt.Sprintf("%s | break_chars: %s\n", param, strings.Join(breaks, ", ")))
+				}
+			}
+			triageContent.WriteString("\n")
+		}
+
+		triageContent.WriteString("[DOM CANARY]\n")
+		if domCount == 0 {
+			triageContent.WriteString("none\n\n")
+		} else {
+			for _, line := range p3Findings["dom"] {
+				var domOut DomSinkOutput
+				if err := json.Unmarshal([]byte(line), &domOut); err == nil {
+					sinksStr := strings.Join(domOut.Sinks, ", ")
+					triageContent.WriteString(fmt.Sprintf("%s | sinks: %s\n", domOut.URL, sinksStr))
+				} else {
+					triageContent.WriteString(line + "\n")
+				}
+			}
+			triageContent.WriteString("\n")
+		}
+
+		triageContent.WriteString("[HEADERS]\n")
+		if len(headers) == 0 {
+			triageContent.WriteString("none\n\n")
+		} else {
+			for _, h := range headers {
+				triageContent.WriteString(h + "\n")
+			}
+			triageContent.WriteString("\n")
+		}
+
+		triageFileName := filepath.Join(outputDir, "triage_"+safeName(targetURL)+".txt")
+		if err := os.WriteFile(triageFileName, []byte(triageContent.String()), 0644); err != nil {
+			logLine("ERROR", X_red, "Failed to write triage file: %v", err)
+		}
+
+		triageMu.Lock()
+		triageEntries = append(triageEntries, TriageEntry{
+			TargetURL:    targetURL,
+			ParamsCount:  len(getParamSet),
+			DomCount:     domCount,
+			HeadersCount: len(headers),
+		})
+		triageMu.Unlock()
+
+		return
+	}
+
+	// If no findings at all and phase > 3, return
 	if len(p3Findings) == 0 && len(candidateHeaders) == 0 {
-		logLine("INFO", X_gray, "No reflective parameters found.")
 		return
 	}
 
 	// Phase 4b: Triage & Context Confirmation
-	logLine("PHASE", X_yellow, "4b/5 Triage & Context Confirmation...")
 	confirmedParams := make(map[string]map[string]bool)
 	for p := range p3Findings {
 		confirmedParams[p] = make(map[string]bool)
 	}
 
-	// Confirm non-header parameters (get, json, dom) as before
-	for phase, urls := range p3Findings {
-		if phase == "dom" {
+	// BUG 1: rename loop variable from "phase" to "probePhase" (first loop)
+	for probePhase, urls := range p3Findings {
+		if probePhase == "dom" {
 			continue
 		}
 		tempRep := VulnerabilityReport{URL: targetURL}
@@ -1121,10 +1348,10 @@ func processURL(targetURL string, index, total int) {
 		for _, u := range urls {
 			dummy += "[canary] [info] " + u + " [x9canary]\n"
 		}
-		tempRep.aggregateFindings(dummy, phase)
+		tempRep.aggregateFindings(dummy, probePhase)
 
 		var vList *[]Vulnerability
-		switch phase {
+		switch probePhase {
 		case "get":
 			vList = &tempRep.QueryParameters
 		case "json":
@@ -1133,24 +1360,23 @@ func processURL(targetURL string, index, total int) {
 
 		if vList != nil {
 			for _, v := range *vList {
-				if ok, p := confirmParameter(targetURL, phase, v.Name); ok {
+				if ok, p := confirmParameter(targetURL, probePhase, v.Name); ok {
 					v.Confirmed = true
 					v.Severity = "confirmed"
 					v.Payloads = p
-					confirmedParams[phase][v.Name] = true
-					switch phase {
+					confirmedParams[probePhase][v.Name] = true
+					switch probePhase {
 					case "get":
 						report.QueryParameters = append(report.QueryParameters, v)
 					case "json":
 						report.JSONBody = append(report.JSONBody, v)
 					}
-					logLine("CONFIRM", X_green, "Confirmed XSS (%s): %s (param: %s)", phase, targetURL, v.Name)
+					logLine("CONFIRM", X_green, "Confirmed XSS (%s): %s (param: %s)", probePhase, targetURL, v.Name)
 				}
 			}
 		}
 	}
 
-	// ---- NEW: Confirm header candidates ----
 	for _, headerName := range candidateHeaders {
 		if ok, payloads := confirmParameter(targetURL, "header", headerName); ok {
 			v := Vulnerability{
@@ -1160,7 +1386,6 @@ func processURL(targetURL string, index, total int) {
 				Payloads:  payloads,
 			}
 			report.Headers = append(report.Headers, v)
-			// Store in confirmedParams for later skipping in attack phase
 			if confirmedParams["header"] == nil {
 				confirmedParams["header"] = make(map[string]bool)
 			}
@@ -1169,12 +1394,11 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 
-	// Phase 4: Heavy Attack (Exclude Confirmed)
-	logLine("PHASE", X_purple, "4/5 Executing Heavy Attacks...")
-
+	// Phase 4: Heavy Attack
 	httpAtkUrls := []string{}
-	for phase, urls := range p3Findings {
-		if phase == "dom" {
+	// BUG 1: rename loop variable from "phase" to "probePhase" (second loop)
+	for probePhase, urls := range p3Findings {
+		if probePhase == "dom" {
 			continue
 		}
 		for _, u := range urls {
@@ -1185,8 +1409,8 @@ func processURL(targetURL string, index, total int) {
 			isConfirmed := false
 
 			query := uParsedAtk.Query()
-			for name := range confirmedParams[phase] {
-				switch phase {
+			for name := range confirmedParams[probePhase] {
+				switch probePhase {
 				case "get":
 					if _, exists := query[name]; exists {
 						isConfirmed = true
@@ -1207,9 +1431,9 @@ func processURL(targetURL string, index, total int) {
 	}
 
 	if len(httpAtkUrls) > 0 {
-		atkIn := filepath.Join(outputDir, safe+"-http-atk-in.txt")
+		atkIn := filepath.Join(outputDir, safeName(targetURL)+"-http-atk-in.txt")
 		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(httpAtkUrls), "\n")), 0644)
-		finalX9Base := filepath.Join(outputDir, safe+"-final-http")
+		finalX9Base := filepath.Join(outputDir, safeName(targetURL)+"-final-http")
 		runCommand("./x9", "-i", atkIn, "-json", "-headers", "-o", finalX9Base)
 
 		exts := map[string]string{".get": "get", ".json": "json"}
@@ -1219,7 +1443,6 @@ func processURL(targetURL string, index, total int) {
 			}
 		}
 
-		// ---- NEW: Handle header attack directly ----
 		headerAtkFile := finalX9Base + ".header"
 		if _, err := os.Stat(headerAtkFile); err == nil {
 			file, err := os.Open(headerAtkFile)
@@ -1243,18 +1466,14 @@ func processURL(targetURL string, index, total int) {
 					headerName := strings.TrimSpace(headerParts[0])
 					headerValue := strings.TrimSpace(headerParts[1])
 
-					// Skip if already confirmed
 					if confirmedParams["header"] != nil && confirmedParams["header"][headerName] {
 						continue
 					}
 
-					// Check reflection
 					if checkHeaderReflection(urlPart, headerName, headerValue) {
-						// Add to report.Headers (if not already)
 						found := false
 						for i, v := range report.Headers {
 							if v.Name == headerName {
-								// Add payload if not present
 								exists := false
 								for _, p := range v.Payloads {
 									if p == headerValue {
@@ -1284,7 +1503,7 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 
-	// Phase 4 DOM: only fragment URLs
+	// Phase 4 DOM: fragment URLs
 	var fragmentURLs []string
 	for _, line := range p3Findings["dom"] {
 		var domOut DomSinkOutput
@@ -1297,9 +1516,9 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 	if len(fragmentURLs) > 0 {
-		atkIn := filepath.Join(outputDir, safe+"-dom-atk-in.txt")
+		atkIn := filepath.Join(outputDir, safeName(targetURL)+"-dom-atk-in.txt")
 		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(fragmentURLs), "\n")), 0644)
-		finalX9Base := filepath.Join(outputDir, safe+"-final-dom")
+		finalX9Base := filepath.Join(outputDir, safeName(targetURL)+"-final-dom")
 		runCommand("./x9", "-i", atkIn, "-dom", "-o", finalX9Base)
 		if domSinkCheckerExists {
 			if dom, _ := runCommand("./dom_sink_checker", "-xss", "-l", finalX9Base+".dom.attack", "-timeout", "300"); dom != "" {
@@ -1307,8 +1526,7 @@ func processURL(targetURL string, index, total int) {
 			}
 		}
 	}
-	// Add DOM canary findings to report as "likely" before Phase 4c
-	logLine("DEBUG", X_gray, "canary pre-loop: p3Findings dom len=%d", len(p3Findings["dom"]))
+	// Add DOM canary findings to report as "likely"
 	for _, line := range p3Findings["dom"] {
 		var domOut DomSinkOutput
 		if err := json.Unmarshal([]byte(line), &domOut); err != nil {
@@ -1317,7 +1535,7 @@ func processURL(targetURL string, index, total int) {
 		report.processDomJson(domOut, "dom")
 	}
 
-	// Phase 4c: DOM Query Attack (only query param URLs, no fragments)
+	// Phase 4c: DOM Query Attack
 	var domQueryURLs []string
 	for _, line := range p3Findings["dom"] {
 		var domOut DomSinkOutput
@@ -1330,10 +1548,9 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 	if len(domQueryURLs) > 0 {
-		logLine("PHASE", X_purple, "4c/5 Executing DOM Query Attacks...")
-		atkIn := filepath.Join(outputDir, safe+"-dom-query-atk-in.txt")
+		atkIn := filepath.Join(outputDir, safeName(targetURL)+"-dom-query-atk-in.txt")
 		os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(domQueryURLs), "\n")), 0644)
-		finalX9Base := filepath.Join(outputDir, safe+"-final-dom-query")
+		finalX9Base := filepath.Join(outputDir, safeName(targetURL)+"-final-dom-query")
 		runCommand("./x9", "-i", atkIn, "-o", finalX9Base)
 		if domSinkCheckerExists {
 			dom, _ := runCommand("./dom_sink_checker", "-xss", "-l", finalX9Base+".get", "-timeout", "300")
@@ -1417,6 +1634,7 @@ func main() {
 	flag.IntVar(&maxURLsPerTarget, "max-urls", 50, "Max URLs per target")
 	flag.BoolVar(&allowWildcards, "allow-wildcards", false, "Allow wildcard URLs")
 	flag.BoolVar(&skipSPA, "skip-spa", true, "Skip SPA detection (if true, do not check for SPA)")
+	flag.IntVar(&phase, "phase", 4, "Pipeline phase to stop at (2, 3, or 4)")
 	flag.Parse()
 
 	if _, err := exec.LookPath("nuclei"); err == nil {
@@ -1427,7 +1645,6 @@ func main() {
 
 	if _, err := exec.LookPath("./dom_sink_checker"); err == nil {
 		domSinkCheckerExists = true
-		logLine("INFO", X_green, "dom_sink_checker confirmed")
 	} else {
 		logLine("WARN", X_yellow, "dom_sink_checker not found or not executable — DOM phases will be skipped")
 	}
@@ -1474,7 +1691,6 @@ func main() {
 	}
 	urls = concreteURLs
 
-	// ── FIX BUG 1: Scope filter by root domain (unconditional) ──
 	if *singleURL != "" {
 		uTarget, _ := url.Parse(*singleURL)
 		if uTarget != nil {
@@ -1539,7 +1755,27 @@ func main() {
 	}
 	wg.Wait()
 
-	logLine("PHASE", X_white, "5/5 Final Second-Order Check...")
+	if phase == 3 {
+		triageMu.Lock()
+		if len(triageEntries) > 0 {
+			summaryPath := filepath.Join(outputDir, "triage_summary.txt")
+			f, err := os.Create(summaryPath)
+			if err == nil {
+				for _, entry := range triageEntries {
+					if entry.ParamsCount > 0 || entry.DomCount > 0 {
+						fmt.Fprintf(f, "%s | params: %d | dom: %d | headers: %d\n",
+							entry.TargetURL, entry.ParamsCount, entry.DomCount, entry.HeadersCount)
+					}
+				}
+				f.Close()
+				logLine("INFO", X_green, "Triage summary written to %s", summaryPath)
+			} else {
+				logLine("ERROR", X_red, "Failed to write triage summary: %v", err)
+			}
+		}
+		triageMu.Unlock()
+	}
+
 	finalIn := filepath.Join(outputDir, "all_crawled_discovery.txt")
 	os.WriteFile(finalIn, []byte(strings.Join(uniqueStrings(allCrawledURLs), "\n")), 0644)
 	if so, _ := runCommand("nuclei", "-l", finalIn, "-t", nucleiTemplate, "-silent"); so != "" {

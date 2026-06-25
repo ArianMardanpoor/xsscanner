@@ -217,7 +217,7 @@ func getSafeName(u string) string {
 
 // ── تابع پردازش هدف ─────────────────────────────────────────────────────────
 
-func processTarget(target string, isSingleTarget bool, skipSPA bool) {
+func processTarget(target string, isSingleTarget bool, skipSPA bool, noCrawl bool, phase int) {
 	logMsg(fmt.Sprintf("--- Starting: %s ---", target), M_purple+M_bold)
 
 	u, err := url.Parse(target)
@@ -243,22 +243,26 @@ func processTarget(target string, isSingleTarget bool, skipSPA bool) {
 	os.MkdirAll(katanaDir, 0755)
 	os.MkdirAll(paramsDir, 0755)
 
-	// Step 1: Run Passive, Katana, and Params in parallel
+	// Step 1: Run Passive, Katana (conditionally), and Params in parallel
 	var wg sync.WaitGroup
-	wg.Add(3)
 
-	go func() {
-		defer wg.Done()
-		logMsg(fmt.Sprintf("Running nice_passive for %s", target), M_gray)
-		runBinary("./nice_passive", "-o", passiveDir, hostname)
-	}()
+	if !noCrawl {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			logMsg(fmt.Sprintf("Running nice_passive for %s", target), M_gray)
+			runBinary("./nice_passive", "-o", passiveDir, hostname)
+		}()
 
-	go func() {
-		defer wg.Done()
-		logMsg(fmt.Sprintf("Running nice_katana for %s", target), M_gray)
-		runBinary("./nice_katana", "-o", katanaDir, target)
-	}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			logMsg(fmt.Sprintf("Running nice_katana for %s", target), M_gray)
+			runBinary("./nice_katana", "-o", katanaDir, target)
+		}()
+	}
 
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		logMsg(fmt.Sprintf("Running nice_params for %s", target), M_gray)
@@ -306,17 +310,21 @@ func processTarget(target string, isSingleTarget bool, skipSPA bool) {
 			}
 		}
 
-		appendSafe(filepath.Join(passiveDir, hostname+".passive"))
-		appendSafe(filepath.Join(katanaDir, safeURL+"-katana.txt"))
+		if !noCrawl {
+			appendSafe(filepath.Join(passiveDir, hostname+".passive"))
+			appendSafe(filepath.Join(katanaDir, safeURL+"-katana.txt"))
+		}
 	}
 
-	// Run xssniper with proper flags, including -skip-spa
+	// Run xssniper with proper flags, including -skip-spa and -phase
 	args := []string{"-l", jobFile, "-p", paramFilePath, "-w", "3"}
 	if isSingleTarget {
 		args = append(args, "-u", target)
 	}
-	// اضافه کردن پرچم skip-spa
-	args = append(args, "-skip-spa", fmt.Sprintf("%v", skipSPA))
+	if skipSPA {
+		args = append(args, "-skip-spa")
+	}
+	args = append(args, "-phase", fmt.Sprintf("%d", phase))
 
 	runBinary("./xssniper", args...)
 
@@ -330,6 +338,8 @@ func main() {
 	inputFile := flag.String("i", "", "Input file with targets (skips API)")
 	targetURL := flag.String("u", "", "Single target URL to scan")
 	skipSPA := flag.Bool("skip-spa", true, "Skip SPA detection (if true, do not check for SPA)")
+	noCrawl := flag.Bool("no-crawl", false, "Skip passive and katana crawling entirely")
+	phase := flag.Int("phase", 4, "Pipeline phase to stop at (2, 3, or 4)")
 	flag.Parse()
 
 	var newTargets []string
@@ -375,6 +385,6 @@ func main() {
 
 	logMsg(fmt.Sprintf("Ready to process %d targets in %s mode.", len(newTargets), strings.ToUpper(*mode)), M_cyan)
 	for _, target := range newTargets {
-		processTarget(target, isSingleTarget, *skipSPA)
+		processTarget(target, isSingleTarget, *skipSPA, *noCrawl, *phase)
 	}
 }

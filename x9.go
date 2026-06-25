@@ -1,5 +1,9 @@
 // FILE: x9.go — MODIFIED
-// Changes: Bug 2: Add 'message' and 'template' to defaultParams. Align break payloads with Bug 1 requirements. Ensure fragment injection preserves query parameters.
+// Changes:
+// - Added -strict flag (default false).
+// - When strict=true, only use parameters present in the URL and from -p file;
+//   defaultParams are NOT added.
+// - If strict=true and URL has no query params, skip and print to stderr.
 
 package main
 
@@ -121,13 +125,16 @@ func buildURL(base *ParsedURL, params map[string]string) string {
 	return u.String()
 }
 
-func getAllParams(originalParams map[string]string, paramFile string, probeMode bool) []string {
+// getAllParams now accepts a 'strict' flag.
+// When strict=true, defaultParams are NOT added; only original params and those from paramFile are used.
+func getAllParams(originalParams map[string]string, paramFile string, probeMode bool, strict bool) []string {
 	allParamsMap := make(map[string]bool)
 	for k := range originalParams {
 		allParamsMap[k] = true
 	}
 
-	if probeMode || len(allParamsMap) == 0 {
+	// Only add defaultParams if strict is false and (probeMode or no original params)
+	if !strict && (probeMode || len(allParamsMap) == 0) {
 		for _, p := range defaultParams {
 			allParamsMap[p] = true
 		}
@@ -164,6 +171,7 @@ func main() {
 		jsonMode   bool
 		headerMode bool
 		domMode    bool
+		strictMode bool // NEW
 	)
 
 	flag.StringVar(&inputFile, "i", "", "File containing URLs")
@@ -174,6 +182,7 @@ func main() {
 	flag.BoolVar(&jsonMode, "json", false, "Enable JSON body generation")
 	flag.BoolVar(&headerMode, "headers", false, "Enable Header injection mode")
 	flag.BoolVar(&domMode, "dom", false, "Enable DOM fragment injection mode")
+	flag.BoolVar(&strictMode, "strict", false, "Only use existing parameters, no default list") // NEW
 	flag.Parse()
 
 	if inputFile == "" && singleURL == "" {
@@ -223,6 +232,12 @@ func main() {
 			continue
 		}
 
+		// If strict mode is enabled and the URL has no query parameters, skip it.
+		if strictMode && len(base.Params) == 0 {
+			fmt.Fprintf(os.Stderr, "[SKIP] no params in URL, strict mode active: %s\n", raw)
+			continue
+		}
+
 		var payloads []string
 		if probeMode {
 			payloads = []string{"x9canary" + randomString(3)}
@@ -230,7 +245,8 @@ func main() {
 			payloads = getBreakPayloads()
 		}
 
-		allParams := getAllParams(base.Params, paramFile, probeMode)
+		// Pass strictMode to getAllParams
+		allParams := getAllParams(base.Params, paramFile, probeMode, strictMode)
 
 		for _, payload := range payloads {
 			// 1. Standard URL Parameters
