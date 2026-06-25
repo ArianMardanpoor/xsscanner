@@ -46,7 +46,12 @@ const canaryHook = `
             Object.defineProperty(proto, prop, {
                 configurable: true,
                 get: function() { return desc.get.call(this); },
-                set: function(v) { track(prop, v); desc.set.call(this, v); }
+                set: function(v) { 
+                    var s = String(v);
+                    if (s === "null" || s === "undefined" || s === "" || s === "null") return desc.set.call(this, v);
+                    track(prop, v); 
+                    desc.set.call(this, v); 
+                }
             });
         } catch(e) {}
     });
@@ -84,7 +89,12 @@ const xssHook = `
             Object.defineProperty(proto, prop, {
                 configurable: true,
                 get: function() { return desc.get.call(this); },
-                set: function(v) { track(prop, v); desc.set.call(this, v); }
+                set: function(v) { 
+                    var s = String(v);
+                    if (s === "null" || s === "undefined" || s === "" || s === "null") return desc.set.call(this, v);
+                    track(prop, v); 
+                    desc.set.call(this, v); 
+                }
             });
         } catch(e) {}
     });

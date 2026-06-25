@@ -27,8 +27,19 @@ const (
 	M_cyan   = "\033[36m"
 )
 
+// ── توابع کمکی ───────────────────────────────────────────────────────────────
+
+// extractRootDomain همان منطقی که در xssniper.go استفاده شده است
+func extractRootDomain(hostname string) string {
+	parts := strings.Split(hostname, ".")
+	if len(parts) <= 2 {
+		return hostname
+	}
+	return strings.Join(parts[len(parts)-2:], ".")
+}
+
+// isGoodURL (همان کد موجود)
 var (
-	// FIX BUG2B: Add regexes for URL filtering
 	reNumeric     = regexp.MustCompile(`^\d+$`)
 	reSemver      = regexp.MustCompile(`^\d+\.\d+(\.\d+)?$`)
 	reCSSValue    = regexp.MustCompile(`^\d+(px|em|rem|vh|vw|ms|fr|%)$`)
@@ -38,7 +49,6 @@ var (
 	reLower       = regexp.MustCompile(`[a-z]`)
 )
 
-// FIX BUG2B: Helper for high entropy segments
 func isHighEntropySegment(s string) bool {
 	if len(s) < 40 {
 		return false
@@ -46,7 +56,6 @@ func isHighEntropySegment(s string) bool {
 	return reUpper.MatchString(s) && reDigit.MatchString(s) && reLower.MatchString(s)
 }
 
-// FIX BUG2B: Duplicate isGoodURL for main.go
 func isGoodURL(rawURL string) bool {
 	extensions := []string{".json", ".js", ".fnt", ".ogg", ".css", ".jpg", ".jpeg", ".png", ".svg", ".img", ".gif", ".exe", ".mp4", ".flv", ".pdf", ".doc", ".ogv", ".webm", ".wmv", ".webp", ".mov", ".mp3", ".m4a", ".m4p", ".ppt", ".pptx", ".scss", ".tif", ".tiff", ".ttf", ".otf", ".woff", ".woff2", ".bmp", ".ico", ".eot", ".htc", ".swf", ".rtf", ".image", ".rf", ".txt", ".xml", ".zip"}
 	parsed, err := url.Parse(rawURL)
@@ -86,6 +95,8 @@ func isGoodURL(rawURL string) bool {
 
 	return true
 }
+
+// ── متغیرهای عمومی ──────────────────────────────────────────────────────────
 
 var (
 	apiURL          = "http://localhost:3131/api/http"
@@ -204,7 +215,9 @@ func getSafeName(u string) string {
 	return regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(u, "_")
 }
 
-func processTarget(target string, isSingleTarget bool) {
+// ── تابع پردازش هدف ─────────────────────────────────────────────────────────
+
+func processTarget(target string, isSingleTarget bool, skipSPA bool) {
 	logMsg(fmt.Sprintf("--- Starting: %s ---", target), M_purple+M_bold)
 
 	u, err := url.Parse(target)
@@ -217,6 +230,9 @@ func processTarget(target string, isSingleTarget bool) {
 		hostname = target
 	}
 	safeURL := getSafeName(target)
+
+	// دامنه‌ی ریشه برای فیلتر کردن
+	rootDomain := extractRootDomain(hostname)
 
 	// Results subdirectories
 	passiveDir := filepath.Join(globalOutputDir, "passive")
@@ -262,12 +278,7 @@ func processTarget(target string, isSingleTarget bool) {
 		defer f.Close()
 		f.WriteString(target + "\n")
 
-		var targetHost string
-		if isSingleTarget {
-			targetHost = u.Host
-		}
-
-		// Helper to append file content carefully with optional filtering
+		// Helper to append file content with scope filtering (always applied)
 		appendSafe := func(path string) {
 			if pFile, err := os.Open(path); err == nil {
 				scanner := bufio.NewScanner(pFile)
@@ -276,17 +287,17 @@ func processTarget(target string, isSingleTarget bool) {
 					if line == "" {
 						continue
 					}
-					// Bug 3: Filter results in single-target mode to exclude unrelated hosts
-					if isSingleTarget {
-						if lURL, err := url.Parse(line); err == nil {
-							if lURL.Host != targetHost {
-								continue
-							}
-						} else {
+					// 1) فیلتر دامنه بر اساس rootDomain (همیشه)
+					if lURL, err := url.Parse(line); err == nil {
+						lHost := lURL.Hostname()
+						if lHost != rootDomain && !strings.HasSuffix(lHost, "."+rootDomain) {
 							continue
 						}
+					} else {
+						continue
 					}
-					if !isGoodURL(line) { // FIX BUG2B: Add quality check
+					// 2) فیلتر کیفیت URL (isGoodURL)
+					if !isGoodURL(line) {
 						continue
 					}
 					f.WriteString(line + "\n")
@@ -299,20 +310,26 @@ func processTarget(target string, isSingleTarget bool) {
 		appendSafe(filepath.Join(katanaDir, safeURL+"-katana.txt"))
 	}
 
-	// Run xssniper
+	// Run xssniper with proper flags, including -skip-spa
 	args := []string{"-l", jobFile, "-p", paramFilePath, "-w", "3"}
 	if isSingleTarget {
 		args = append(args, "-u", target)
 	}
+	// اضافه کردن پرچم skip-spa
+	args = append(args, "-skip-spa", fmt.Sprintf("%v", skipSPA))
+
 	runBinary("./xssniper", args...)
 
 	markAsScanned(target)
 }
 
+// ── main ────────────────────────────────────────────────────────────────────
+
 func main() {
 	mode := flag.String("mode", "normal", "Scan mode: normal or fresh")
 	inputFile := flag.String("i", "", "Input file with targets (skips API)")
 	targetURL := flag.String("u", "", "Single target URL to scan")
+	skipSPA := flag.Bool("skip-spa", true, "Skip SPA detection (if true, do not check for SPA)")
 	flag.Parse()
 
 	var newTargets []string
@@ -358,6 +375,6 @@ func main() {
 
 	logMsg(fmt.Sprintf("Ready to process %d targets in %s mode.", len(newTargets), strings.ToUpper(*mode)), M_cyan)
 	for _, target := range newTargets {
-		processTarget(target, isSingleTarget)
+		processTarget(target, isSingleTarget, *skipSPA)
 	}
 }

@@ -1,5 +1,8 @@
-// FILE: xssniper.go — MODIFIED
-// Changes: Replaced nuclei headless with dom_sink_checker for DOM XSS detection.
+// FILE: xssniper.go — REFACTORED
+// Changes:
+// - Scope filter by root domain in main()
+// - Added SPA detection with -skip-spa flag
+// - Early return in processURL if SPA detected
 
 package main
 
@@ -23,6 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 // ── Telegram Configuration ───────────────────────────────────────────────────
@@ -98,12 +102,12 @@ func (r *VulnerabilityReport) processDomJson(domOut DomSinkOutput, phase string)
 		severity = "confirmed"
 		confirmed = true
 
-		// BUG 1 Fix: Verify reflection in HTTP response body
 		canary := ""
 		if m := reX9.FindString(domOut.URL); m != "" {
 			canary = m
 		}
-		if canary != "" {
+
+		if canary != "" && u.Fragment != "" {
 			if !reflectionExists(domOut.URL, "GET", nil, "", canary) {
 				severity = "possible"
 				confirmed = false
@@ -115,7 +119,8 @@ func (r *VulnerabilityReport) processDomJson(domOut DomSinkOutput, phase string)
 
 	found := false
 	for i, v := range r.DOM {
-		if v.Name == name {
+		baseName := strings.Split(v.Name, " (Note:")[0]
+		if baseName == name {
 			for _, sink := range domOut.Sinks {
 				exists := false
 				for _, p := range v.Payloads {
@@ -142,6 +147,7 @@ func (r *VulnerabilityReport) processDomJson(domOut DomSinkOutput, phase string)
 			break
 		}
 	}
+
 	if !found {
 		r.DOM = append(r.DOM, Vulnerability{
 			Name:      name + note,
@@ -166,7 +172,6 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 			continue
 		}
 
-		// Handle DOM JSON output from dom_sink_checker
 		if (phase == "dom" || phase == "dom_confirmed") && strings.HasPrefix(line, "{") {
 			var domOut DomSinkOutput
 			if err := json.Unmarshal([]byte(line), &domOut); err == nil {
@@ -175,7 +180,6 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 			}
 		}
 
-		// 1. Extract payload
 		payload := ""
 		if m := rePayload.FindStringSubmatch(line); len(m) > 0 {
 			if m[1] != "" {
@@ -185,7 +189,6 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 			}
 		}
 
-		// 2. Extract URL and injection point
 		rawURL := ""
 		parts := strings.Fields(line)
 		for _, p := range parts {
@@ -284,7 +287,6 @@ func (r *VulnerabilityReport) aggregateFindings(nucleiOutput string, phase strin
 			severity = "confirmed"
 			phase = "dom"
 
-			// BUG 1 Fix for legacy nuclei-style line parsing
 			canary := ""
 			if m := reX9.FindString(rawURL); m != "" {
 				canary = m
@@ -598,6 +600,7 @@ var (
 	workerLock           sync.Map
 	nucleiExists         bool
 	domSinkCheckerExists bool
+	skipSPA              bool // NEW: flag to skip SPA detection
 
 	reX9       = regexp.MustCompile(`x9(?:canary)?[a-z]*`)
 	rePayload  = regexp.MustCompile(`\[(?:"([^"]+)"|([^"\]]+))\]$`)
@@ -663,7 +666,6 @@ func isConcreteURL(rawURL string) bool {
 	return true
 }
 
-// FIX BUG6: Optimized liveness check
 func isTargetAlive(targetURL string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -676,7 +678,6 @@ func isTargetAlive(targetURL string) bool {
 			return nil
 		},
 	}
-	// Strip fragment before HEAD check
 	u, err := url.Parse(targetURL)
 	if err != nil {
 		return false
@@ -688,7 +689,6 @@ func isTargetAlive(targetURL string) bool {
 	resp, err := client.Do(req)
 
 	if err != nil {
-		// Connection error - retry GET with shorter timeout
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel2()
 		reqGET, _ := http.NewRequestWithContext(ctx2, "GET", checkURL, nil)
@@ -702,9 +702,8 @@ func isTargetAlive(targetURL string) bool {
 			return true
 		}
 		if resp.StatusCode >= 404 && resp.StatusCode != 405 {
-			return false // Definitely dead
+			return false
 		}
-		// 405 Method Not Allowed - retry with GET
 		reqGET, _ := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
 		resp, err = client.Do(reqGET)
 		if err != nil {
@@ -743,6 +742,71 @@ func extractURLsFromNuclei(nucleiOutput string) []string {
 		}
 	}
 	return urls
+}
+
+// ── SPA Detection ────────────────────────────────────────────────────────────
+
+func isSPA(targetURL string) bool {
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; xssniper)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+	body := string(bodyBytes)
+
+	// 1. Static markers
+	markers := []string{
+		`<div id="root"`,
+		`<div id="app"`,
+		`__NEXT_DATA__`,
+		`window.__INITIAL_STATE__`,
+		`ReactDOM.render`,
+		`ng-version=`,
+		`data-reactroot`,
+	}
+	for _, m := range markers {
+		if strings.Contains(body, m) {
+			return true
+		}
+	}
+
+	// 2. Visible text length (strip script/style tags)
+	reScript := regexp.MustCompile(`(?s)<script[^>]*>.*?</script>`)
+	reStyle := regexp.MustCompile(`(?s)<style[^>]*>.*?</style>`)
+	clean := reScript.ReplaceAllString(body, "")
+	clean = reStyle.ReplaceAllString(clean, "")
+	reTag := regexp.MustCompile(`<[^>]*>`)
+	text := reTag.ReplaceAllString(clean, " ")
+	visibleCount := 0
+	for _, ch := range text {
+		if !unicode.IsSpace(ch) {
+			visibleCount++
+		}
+	}
+	if visibleCount < 500 {
+		return true
+	}
+
+	// 3. Headers + near‑empty body (already checked visibleCount<500)
+	xPoweredBy := resp.Header.Get("x-powered-by")
+	if strings.Contains(strings.ToLower(xPoweredBy), "next.js") && visibleCount < 500 {
+		return true
+	}
+	if strings.Contains(strings.ToLower(xPoweredBy), "express") && visibleCount < 500 {
+		return true
+	}
+
+	return false
 }
 
 // ── Core Logic ────────────────────────────────────────────────────────────────
@@ -818,8 +882,13 @@ func reflectionExists(targetURL, method string, headers map[string]string, body,
 	return strings.Contains(string(b), payload)
 }
 
+// checkHeaderReflection performs a GET request with the given header and checks if the value is reflected.
+func checkHeaderReflection(targetURL, headerName, headerValue string) bool {
+	headers := map[string]string{headerName: headerValue}
+	return reflectionExists(targetURL, "GET", headers, "", headerValue)
+}
+
 func processURL(targetURL string, index, total int) {
-	// Bug 5: Normalize targetURL before checking workerLock
 	uParsed, err := url.Parse(targetURL)
 	normalizedLockURL := targetURL
 	if err == nil {
@@ -842,7 +911,12 @@ func processURL(targetURL string, index, total int) {
 	currVulns := atomic.LoadInt64(&vulnerableTargets)
 
 	logLine("TARGET", X_white, "[%d/%d | Vulns: %d] %s", currProcessed, total, currVulns, targetURL)
-	safe := regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(targetURL, "_")
+
+	// ── SPA DETECTION (NEW) ──
+	if !skipSPA && isSPA(targetURL) {
+		logLine("SKIP", X_yellow, "SPA/React detected, skipping heavy scan for %s", targetURL)
+		return
+	}
 
 	report := VulnerabilityReport{URL: targetURL}
 
@@ -853,9 +927,9 @@ func processURL(targetURL string, index, total int) {
 
 	probeOutputBase := filepath.Join(outputDir, safe+"-probe-out")
 	runCommand("./x9", "-probe", "-json", "-headers", "-dom", "-i", probeInput, "-o", probeOutputBase)
-	// Phase 2: Canary Probe - DOM query params
-	logLine("PHASE", X_cyan, "2/5 Canary Probing (DOM query params)...")
 
+	// Phase 2: Canary Probing - DOM query params
+	logLine("PHASE", X_cyan, "2/5 Canary Probing (DOM query params)...")
 	domQueryProbeFile := filepath.Join(outputDir, safe+"-dom-query-probe.txt")
 	paramsToProbe := []string{}
 	if paramFile != "" {
@@ -869,7 +943,6 @@ func processURL(targetURL string, index, total int) {
 			pf.Close()
 		}
 	}
-	// FIX BUG5: fallback to a hardcoded set of high-value DOM params
 	if len(paramsToProbe) == 0 {
 		paramsToProbe = []string{
 			"q", "s", "search", "id", "url", "redirect", "next", "return",
@@ -896,10 +969,11 @@ func processURL(targetURL string, index, total int) {
 			os.WriteFile(domQueryProbeFile, []byte(strings.Join(domProbeURLs, "\n")), 0644)
 		}
 	}
+
 	// Phase 3: Filter Vulnerable Parameters
 	logLine("PHASE", X_blue, "3/5 Filtering reflective parameters...")
 
-	targetAlive := isTargetAlive(targetURL) // FIX BUG1: Cache liveness status
+	targetAlive := isTargetAlive(targetURL)
 
 	probeFiles := map[string]string{
 		probeOutputBase + ".get":        "get",
@@ -909,16 +983,16 @@ func processURL(targetURL string, index, total int) {
 	}
 
 	p3Findings := make(map[string][]string)
+	candidateHeaders := []string{} // new: store header names that reflect canary
 
 	for pf, phase := range probeFiles {
 		if _, err := os.Stat(pf); err == nil {
 			if phase == "dom" {
-				if !targetAlive { // FIX BUG1: HTTP liveness pre-check
+				if !targetAlive {
 					logLine("DEBUG", X_gray, "Target dead, skipping DOM canary for %s", targetURL)
 					continue
 				}
 
-				// Bug 3: Add enhanced debug logs for DOM canary
 				content, _ := os.ReadFile(pf)
 				lines := strings.Split(strings.TrimSpace(string(content)), "\n")
 				lineCount := 0
@@ -939,7 +1013,6 @@ func processURL(targetURL string, index, total int) {
 						lines := strings.Split(strings.TrimSpace(res), "\n")
 						for _, l := range lines {
 							l = strings.TrimSpace(l)
-							// FIX BUG3: only add valid JSON dom sink outputs
 							var probe DomSinkOutput
 							if err := json.Unmarshal([]byte(l), &probe); err == nil && probe.URL != "" {
 								p3Findings["dom"] = append(p3Findings["dom"], l)
@@ -947,16 +1020,61 @@ func processURL(targetURL string, index, total int) {
 						}
 					}
 				}
+			} else if phase == "header" {
+				// ---- NEW: Handle header canary directly without nuclei ----
+				file, err := os.Open(pf)
+				if err != nil {
+					continue
+				}
+				scanner := bufio.NewScanner(file)
+				for scanner.Scan() {
+					line := strings.TrimSpace(scanner.Text())
+					if line == "" {
+						continue
+					}
+					// Expected format: url|HeaderName:value
+					parts := strings.SplitN(line, "|", 2)
+					if len(parts) != 2 {
+						continue
+					}
+					urlPart := parts[0]
+					headerPart := parts[1]
+					headerParts := strings.SplitN(headerPart, ":", 2)
+					if len(headerParts) != 2 {
+						continue
+					}
+					headerName := strings.TrimSpace(headerParts[0])
+					headerValue := strings.TrimSpace(headerParts[1])
+
+					// Check if the canary is reflected
+					if checkHeaderReflection(urlPart, headerName, headerValue) {
+						// Add to candidateHeaders (dedupe)
+						found := false
+						for _, h := range candidateHeaders {
+							if h == headerName {
+								found = true
+								break
+							}
+						}
+						if !found {
+							candidateHeaders = append(candidateHeaders, headerName)
+							logLine("DEBUG", X_gray, "Found reflective header: %s", headerName)
+						}
+					}
+				}
+				file.Close()
+				// Do not add to p3Findings
 			} else {
+				// GET and JSON: use nuclei
 				res, _ := runCommand("nuclei", "-l", pf, "-t", canaryTemplate, "-silent")
 				p3Findings[phase] = append(p3Findings[phase], extractURLsFromNuclei(res)...)
 			}
 		}
 	}
 
-	// Bug 1: Move DOM Query probe before triage and check
+	// DOM query probe
 	if _, err := os.Stat(domQueryProbeFile); err == nil {
-		if !targetAlive { // FIX BUG1: HTTP liveness pre-check
+		if !targetAlive {
 			logLine("DEBUG", X_gray, "Target dead, skipping DOM query probe for %s", targetURL)
 		} else if domSinkCheckerExists {
 			lineCount := countLines(domQueryProbeFile)
@@ -971,7 +1089,6 @@ func processURL(targetURL string, index, total int) {
 				lines := strings.Split(strings.TrimSpace(res), "\n")
 				for _, l := range lines {
 					l = strings.TrimSpace(l)
-					// FIX BUG3: only add valid JSON dom sink outputs
 					var probe DomSinkOutput
 					if err := json.Unmarshal([]byte(l), &probe); err == nil && probe.URL != "" {
 						p3Findings["dom"] = append(p3Findings["dom"], l)
@@ -981,17 +1098,20 @@ func processURL(targetURL string, index, total int) {
 		}
 	}
 
-	if len(p3Findings) == 0 {
+	// If no findings at all (including header candidates), return
+	if len(p3Findings) == 0 && len(candidateHeaders) == 0 {
 		logLine("INFO", X_gray, "No reflective parameters found.")
 		return
 	}
-	// Phase 4b: Confirmation Triage
+
+	// Phase 4b: Triage & Context Confirmation
 	logLine("PHASE", X_yellow, "4b/5 Triage & Context Confirmation...")
 	confirmedParams := make(map[string]map[string]bool)
 	for p := range p3Findings {
 		confirmedParams[p] = make(map[string]bool)
 	}
 
+	// Confirm non-header parameters (get, json, dom) as before
 	for phase, urls := range p3Findings {
 		if phase == "dom" {
 			continue
@@ -1007,15 +1127,12 @@ func processURL(targetURL string, index, total int) {
 		switch phase {
 		case "get":
 			vList = &tempRep.QueryParameters
-		case "header":
-			vList = &tempRep.Headers
 		case "json":
 			vList = &tempRep.JSONBody
 		}
 
 		if vList != nil {
 			for _, v := range *vList {
-				// Bug 1: Use x9 break-character payloads for confirmation
 				if ok, p := confirmParameter(targetURL, phase, v.Name); ok {
 					v.Confirmed = true
 					v.Severity = "confirmed"
@@ -1024,14 +1141,31 @@ func processURL(targetURL string, index, total int) {
 					switch phase {
 					case "get":
 						report.QueryParameters = append(report.QueryParameters, v)
-					case "header":
-						report.Headers = append(report.Headers, v)
 					case "json":
 						report.JSONBody = append(report.JSONBody, v)
 					}
 					logLine("CONFIRM", X_green, "Confirmed XSS (%s): %s (param: %s)", phase, targetURL, v.Name)
 				}
 			}
+		}
+	}
+
+	// ---- NEW: Confirm header candidates ----
+	for _, headerName := range candidateHeaders {
+		if ok, payloads := confirmParameter(targetURL, "header", headerName); ok {
+			v := Vulnerability{
+				Name:      headerName,
+				Severity:  "confirmed",
+				Confirmed: true,
+				Payloads:  payloads,
+			}
+			report.Headers = append(report.Headers, v)
+			// Store in confirmedParams for later skipping in attack phase
+			if confirmedParams["header"] == nil {
+				confirmedParams["header"] = make(map[string]bool)
+			}
+			confirmedParams["header"][headerName] = true
+			logLine("CONFIRM", X_green, "Confirmed XSS (header): %s (header: %s)", targetURL, headerName)
 		}
 	}
 
@@ -1057,10 +1191,6 @@ func processURL(targetURL string, index, total int) {
 					if _, exists := query[name]; exists {
 						isConfirmed = true
 					}
-				case "header":
-					if strings.Contains(u, name+":") {
-						isConfirmed = true
-					}
 				case "json":
 					if strings.Contains(u, "\""+name+"\"") {
 						isConfirmed = true
@@ -1082,15 +1212,79 @@ func processURL(targetURL string, index, total int) {
 		finalX9Base := filepath.Join(outputDir, safe+"-final-http")
 		runCommand("./x9", "-i", atkIn, "-json", "-headers", "-o", finalX9Base)
 
-		exts := map[string]string{".get": "get", ".json": "json", ".header": "header"}
+		exts := map[string]string{".get": "get", ".json": "json"}
 		for ext, ph := range exts {
 			if findings, _ := runCommand("nuclei", "-l", finalX9Base+ext, "-t", nucleiTemplate, "-silent"); findings != "" {
 				report.aggregateFindings(findings, ph)
 			}
 		}
+
+		// ---- NEW: Handle header attack directly ----
+		headerAtkFile := finalX9Base + ".header"
+		if _, err := os.Stat(headerAtkFile); err == nil {
+			file, err := os.Open(headerAtkFile)
+			if err == nil {
+				scanner := bufio.NewScanner(file)
+				for scanner.Scan() {
+					line := strings.TrimSpace(scanner.Text())
+					if line == "" {
+						continue
+					}
+					parts := strings.SplitN(line, "|", 2)
+					if len(parts) != 2 {
+						continue
+					}
+					urlPart := parts[0]
+					headerPart := parts[1]
+					headerParts := strings.SplitN(headerPart, ":", 2)
+					if len(headerParts) != 2 {
+						continue
+					}
+					headerName := strings.TrimSpace(headerParts[0])
+					headerValue := strings.TrimSpace(headerParts[1])
+
+					// Skip if already confirmed
+					if confirmedParams["header"] != nil && confirmedParams["header"][headerName] {
+						continue
+					}
+
+					// Check reflection
+					if checkHeaderReflection(urlPart, headerName, headerValue) {
+						// Add to report.Headers (if not already)
+						found := false
+						for i, v := range report.Headers {
+							if v.Name == headerName {
+								// Add payload if not present
+								exists := false
+								for _, p := range v.Payloads {
+									if p == headerValue {
+										exists = true
+										break
+									}
+								}
+								if !exists {
+									report.Headers[i].Payloads = append(report.Headers[i].Payloads, headerValue)
+								}
+								found = true
+								break
+							}
+						}
+						if !found {
+							report.Headers = append(report.Headers, Vulnerability{
+								Name:     headerName,
+								Severity: "likely",
+								Payloads: []string{headerValue},
+							})
+						}
+						logLine("FIND", X_green, "Found header reflection: %s = %s", headerName, headerValue)
+					}
+				}
+				file.Close()
+			}
+		}
 	}
 
-	// Phase 4 DOM: فقط fragment URLs (location.hash sinks)
+	// Phase 4 DOM: only fragment URLs
 	var fragmentURLs []string
 	for _, line := range p3Findings["dom"] {
 		var domOut DomSinkOutput
@@ -1153,6 +1347,15 @@ func processURL(targetURL string, index, total int) {
 		tg.notify(report)
 	}
 }
+
+// ── Helper: safe name for file naming ──────────────────────────────────────
+
+var safeNameRe = regexp.MustCompile(`[^a-zA-Z0-9]`)
+
+func safeName(s string) string {
+	return safeNameRe.ReplaceAllString(s, "_")
+}
+
 func uniqueStrings(slice []string) []string {
 	keys := make(map[string]bool)
 	var list []string
@@ -1165,7 +1368,6 @@ func uniqueStrings(slice []string) []string {
 			}
 			continue
 		}
-		// Bug 5: Normalize: remove trailing slash and common index files
 		u.Path = strings.TrimSuffix(u.Path, "/")
 		if strings.HasSuffix(u.Path, "/index.php") {
 			u.Path = strings.TrimSuffix(u.Path, "/index.php")
@@ -1200,6 +1402,8 @@ func countLines(filename string) int {
 	return count
 }
 
+// ── main ────────────────────────────────────────────────────────────────────
+
 func main() {
 	urlFile := flag.String("l", "", "URL list file")
 	singleURL := flag.String("u", "", "Single target URL")
@@ -1212,6 +1416,7 @@ func main() {
 	flag.IntVar(&workers, "w", 3, "Parallel workers")
 	flag.IntVar(&maxURLsPerTarget, "max-urls", 50, "Max URLs per target")
 	flag.BoolVar(&allowWildcards, "allow-wildcards", false, "Allow wildcard URLs")
+	flag.BoolVar(&skipSPA, "skip-spa", true, "Skip SPA detection (if true, do not check for SPA)")
 	flag.Parse()
 
 	if _, err := exec.LookPath("nuclei"); err == nil {
@@ -1269,7 +1474,26 @@ func main() {
 	}
 	urls = concreteURLs
 
-	// Group by root domain for capping
+	// ── FIX BUG 1: Scope filter by root domain (unconditional) ──
+	if *singleURL != "" {
+		uTarget, _ := url.Parse(*singleURL)
+		if uTarget != nil {
+			rootDomain := extractRootDomain(uTarget.Hostname())
+			var filtered []string
+			for _, u := range urls {
+				parsed, err := url.Parse(u)
+				if err != nil {
+					continue
+				}
+				host := parsed.Hostname()
+				if host == rootDomain || strings.HasSuffix(host, "."+rootDomain) {
+					filtered = append(filtered, u)
+				}
+			}
+			urls = filtered
+		}
+	}
+
 	groups := make(map[string][]string)
 	for _, u := range urls {
 		parsed, err := url.Parse(u)
@@ -1282,14 +1506,13 @@ func main() {
 
 	var finalURLs []string
 	for _, groupUrls := range groups {
-		// Sort: URLs with query params first, then by path length (shorter first)
 		sort.Slice(groupUrls, func(i, j int) bool {
 			pi, _ := url.Parse(groupUrls[i])
 			pj, _ := url.Parse(groupUrls[j])
 			hasQi := pi != nil && len(pi.RawQuery) > 0
 			hasQj := pj != nil && len(pj.RawQuery) > 0
 			if hasQi != hasQj {
-				return hasQi // URLs with params come first
+				return hasQi
 			}
 			return len(groupUrls[i]) < len(groupUrls[j])
 		})
@@ -1300,20 +1523,6 @@ func main() {
 		finalURLs = append(finalURLs, groupUrls...)
 	}
 	urls = finalURLs
-
-	if *singleURL != "" {
-		uTarget, _ := url.Parse(*singleURL)
-		if uTarget != nil {
-			var filtered []string
-			for _, u := range urls {
-				parsed, err := url.Parse(u)
-				if err == nil && parsed.Host == uTarget.Host {
-					filtered = append(filtered, u)
-				}
-			}
-			urls = filtered
-		}
-	}
 
 	allCrawledURLs = append(allCrawledURLs, urls...)
 
