@@ -1,0 +1,24 @@
+# Go Compiled Binaries (xsscanner)
+xsscanner/nice_katana
+xsscanner/nice_params
+xsscanner/nice_passive
+xsscanner/x9
+xsscanner/dom_sink_checker
+xsscanner/xssniper
+xsscanner/xsscanner
+
+
+
+#results
+xsscanner/all_scanned_targets.txt
+xsscanner/output/
+xsscanner/results/
+
+#programs
+*.txt
+
+
+
+.env
+.env.*
+!.env.example
