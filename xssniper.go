@@ -1,9 +1,10 @@
 // FILE: xssniper.go — REFACTORED LOGGING, TECH-AWARE ROUTING & JS RISK DETECTION
 // Changes:
-// - Removed IsLegacyServerRendered logic and legacy framework assumptions.
-// - Added hasClientSideJSRisk() to perform a lightweight GET and check for <script> tags.
-// - Changed DOM check skipping logic to only trigger when NO JavaScript is present in the DOM.
-// - Retained SPA logic for skipping Header Injection.
+// - Replaced nuclei with curl_reflect_checker for GET and JSON body reflection checks.
+// - Added curlCheckerExists detection and appropriate logging.
+// - Added helpers: extractReflectedURLsFromCurl, aggregateCurlFindings.
+// - Updated Phase 3 probe loop and Phase 4 heavy-attack loop to use curl_reflect_checker.
+// - FIX BUG2: Migrated http-request-to-target functions from net/http to curl-exec to avoid JA3 blocks.
 
 package main
 
@@ -14,16 +15,15 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"math/rand"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +35,77 @@ import (
 )
 
 var repLogger *reporter.Logger
+
+// FIX BUG2: Shared User-Agent constant for curl requests
+const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+	"AppleWebKit/537.36 (KHTML, like Gecko) " +
+	"Chrome/126.0.0.0 Safari/537.36"
+
+// ── Curl Request Helper ──────────────────────────────────────────────────────
+
+// FIX BUG2: curlRequest issues a single HTTP request via the curl binary (exec'd) instead
+// of Go's net/http, to avoid JA3/TLS fingerprinting blocks by WAFs.
+// Returns the HTTP status code and the response body.
+func curlRequest(targetURL, method string, headers map[string]string, body string, timeout int) (statusCode int, respBody []byte, err error) {
+	args := []string{
+		"-s",
+		"-L",
+		"--max-time", strconv.Itoa(timeout),
+		"-A", userAgent,
+		"-w", "\\nHTTPSTATUS:%{http_code}",
+	}
+
+	if method == "HEAD" {
+		args = append(args, "-I")
+	} else if method == "POST" {
+		args = append(args, "-X", "POST")
+		args = append(args, "-H", "Content-Type: application/json")
+		if body != "" {
+			// Using --data-raw to ensure special break characters (&, <, ', etc.) are not mangled
+			args = append(args, "--data-raw", body)
+		}
+	} else if method != "GET" && method != "" {
+		args = append(args, "-X", method)
+	}
+
+	// FIX BUG2: Always add Cache-Busting headers centrally
+	args = append(args, "-H", "Cache-Control: no-cache, no-store, must-revalidate")
+	args = append(args, "-H", "Pragma: no-cache")
+
+	for k, v := range headers {
+		args = append(args, "-H", fmt.Sprintf("%s: %s", k, v))
+	}
+
+	args = append(args, targetURL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout+10)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "curl", args...)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	stdout, cmdErr := cmd.Output()
+
+	marker := []byte("\nHTTPSTATUS:")
+	idx := bytes.LastIndex(stdout, marker)
+	if idx < 0 {
+		return 0, nil, fmt.Errorf("curl failed or no marker: %v (stderr: %s)", cmdErr, stderrBuf.String())
+	}
+
+	respBody = stdout[:idx]
+	statusStr := strings.TrimSpace(string(stdout[idx+len(marker):]))
+	statusCode, atoiErr := strconv.Atoi(statusStr)
+	if atoiErr != nil {
+		return 0, respBody, fmt.Errorf("unparseable status %q", statusStr)
+	}
+
+	if statusCode == 0 {
+		return 0, respBody, fmt.Errorf("connection failed (status 000)")
+	}
+
+	return statusCode, respBody, nil
+}
 
 // ── Tech Profile & Classification ───────────────────────────────────────────
 
@@ -75,25 +146,14 @@ func classifyTechProfile(techList []string) TechProfile {
 // If it fails or times out, it conservatively returns true (assume JS exists).
 func hasClientSideJSRisk(targetURL string) bool {
 	ratelimit.Acquire(targetURL)
-	client := ratelimit.GetHTTPClient(targetURL)
-	req, err := http.NewRequest("GET", targetURL, nil)
-	if err != nil {
+
+	// FIX BUG2: Replaced net/http logic with curlRequest helper
+	statusCode, respBody, err := curlRequest(targetURL, "GET", nil, "", 15)
+	if err != nil || statusCode == 0 {
 		return true // conservative fallback
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; xssniper)")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return true
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return true
-	}
-
-	bodyLower := strings.ToLower(string(bodyBytes))
+	bodyLower := strings.ToLower(string(respBody))
 	return strings.Contains(bodyLower, "<script")
 }
 
@@ -473,33 +533,13 @@ func severityWeight(s string) int {
 
 func verifyReflection(targetURL, method string, headers map[string]string, body, canary string) bool {
 	ratelimit.Acquire(targetURL)
-	client := ratelimit.GetHTTPClient(targetURL)
-	var req *http.Request
-	var err error
 
-	if method == "POST" {
-		req, err = http.NewRequest("POST", targetURL, strings.NewReader(body))
-		if err == nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
-	} else {
-		req, err = http.NewRequest("GET", targetURL, nil)
-	}
-
-	if err != nil {
+	// FIX BUG2: Replaced net/http setup with curlRequest helper
+	statusCode, respBody, err := curlRequest(targetURL, method, headers, body, 15)
+	if err != nil || statusCode == 0 {
 		return false
 	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
 	return strings.Contains(string(respBody), canary)
 }
 
@@ -567,8 +607,7 @@ func dedupeNucleiFindings(report VulnerabilityReport) string {
 	sb.WriteString(fmt.Sprintf("%s%s%s", X_bold, report.URL, X_reset))
 	renderSection("Query Params", report.QueryParameters)
 	renderSection("Headers", report.Headers)
-	renderSection("JSON Body", report.JSONBody)
-	renderSection("DOM", report.DOM)
+	renderSection("JSON Body", report.DOM)
 	return sb.String()
 }
 
@@ -764,6 +803,7 @@ var (
 	candidateNotified    sync.Map
 	nucleiExists         bool
 	domSinkCheckerExists bool
+	curlCheckerExists    bool // NEW: check for curl_reflect_checker binary
 	skipSPA              bool
 
 	consecutiveDead int64
@@ -838,17 +878,7 @@ func isConcreteURL(rawURL string) bool {
 }
 
 func isTargetAlive(targetURL string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
 	ratelimit.Acquire(targetURL)
-	client := ratelimit.GetHTTPClient(targetURL)
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 3 {
-			return fmt.Errorf("too many redirects")
-		}
-		return nil
-	}
 
 	u, err := url.Parse(targetURL)
 	if err != nil {
@@ -857,34 +887,31 @@ func isTargetAlive(targetURL string) bool {
 	u.Fragment = ""
 	checkURL := u.String()
 
-	req, _ := http.NewRequestWithContext(ctx, "HEAD", checkURL, nil)
-	resp, err := client.Do(req)
+	// FIX BUG2: Implemented HEAD and GET logic using curlRequest. Handles status 000 (conn err) vs 4xx.
+	statusCode, _, err := curlRequest(checkURL, "HEAD", nil, "", 5)
 
-	if err != nil {
-		ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel2()
-		reqGET, _ := http.NewRequestWithContext(ctx2, "GET", checkURL, nil)
-		resp, err = client.Do(reqGET)
-		if err != nil {
+	if statusCode == 0 {
+		// Connection failed completely, fallback to GET to be sure
+		statusCode, _, err = curlRequest(checkURL, "GET", nil, "", 5)
+		if statusCode == 0 {
 			return false
 		}
 	} else {
-		defer resp.Body.Close()
-		if resp.StatusCode < 400 || resp.StatusCode == 401 || resp.StatusCode == 403 {
+		// HTTP response received (transport alive)
+		if statusCode < 400 || statusCode == 401 || statusCode == 403 {
 			return true
 		}
-		if resp.StatusCode >= 404 && resp.StatusCode != 405 {
+		if statusCode >= 404 && statusCode != 405 {
 			return false
 		}
-		reqGET, _ := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
-		resp, err = client.Do(reqGET)
-		if err != nil {
+		// Fallback to GET for 405 or other ambiguous responses
+		statusCode, _, err = curlRequest(checkURL, "GET", nil, "", 5)
+		if statusCode == 0 {
 			return false
 		}
-		defer resp.Body.Close()
 	}
 
-	return resp.StatusCode < 500
+	return statusCode < 500
 }
 
 func checkConnectivity() bool {
@@ -939,33 +966,28 @@ func isGenericReflector(targetURL string) bool {
 	q.Set("xprobe3", "CANARY_C")
 	q.Set("xprobe4", "CANARY_D")
 	q.Set("xprobe5", "CANARY_E")
+
+	// Cache-Busting param for isGenericReflector
+	cbName := "_cb"
+	_, exists := q[cbName]
+	for exists {
+		cbName = "_cb" + randomString(3)
+		_, exists = q[cbName]
+	}
+	q.Set(cbName, fmt.Sprintf("%d_%s", time.Now().UnixNano(), randomString(4)))
+
 	u.RawQuery = q.Encode()
 	finalURL := u.String()
 
 	ratelimit.Acquire(finalURL)
-	client := ratelimit.GetHTTPClient(finalURL)
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 2 {
-			return http.ErrUseLastResponse
-		}
-		return nil
+
+	// FIX BUG2: Use curlRequest
+	statusCode, respBody, err := curlRequest(finalURL, "GET", nil, "", 10)
+	if err != nil || statusCode == 0 {
+		return false
 	}
 
-	req, err := http.NewRequest("GET", finalURL, nil)
-	if err != nil {
-		return false
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false
-	}
-	body := string(bodyBytes)
-
+	body := string(respBody)
 	canaries := []string{"CANARY_A", "CANARY_B", "CANARY_C", "CANARY_D", "CANARY_E"}
 	count := 0
 	for _, c := range canaries {
@@ -1031,34 +1053,32 @@ func reflectionExists(targetURL, method string, headers map[string]string, body,
 	// ۱. گرفتن اجازه (Token) قبل از شروع هر درخواست شبکه برای این دامنه
 	ratelimit.Acquire(targetURL)
 
-	// ۲. استفاده از کلاینت مدیریت‌شده (همراه با Proxy چرخشی و Timeout)
-	client := ratelimit.GetHTTPClient(targetURL)
+	finalURL := targetURL
 
-	var req *http.Request
-	var err error
-	if method == "POST" {
-		req, err = http.NewRequest("POST", targetURL, strings.NewReader(body))
-		if err == nil {
-			req.Header.Set("Content-Type", "application/json")
+	// Cache-Busting param for GET requests in reflection check
+	if method == "GET" {
+		if u, err := url.Parse(targetURL); err == nil {
+			q := u.Query()
+			cbName := "_cb"
+			_, exists := q[cbName]
+			for exists {
+				cbName = "_cb" + randomString(3)
+				_, exists = q[cbName]
+			}
+			cbValue := fmt.Sprintf("%d_%s", time.Now().UnixNano(), randomString(4))
+			q.Set(cbName, cbValue)
+			u.RawQuery = q.Encode()
+			finalURL = u.String()
 		}
-	} else {
-		req, err = http.NewRequest("GET", targetURL, nil)
-	}
-	if err != nil || req == nil {
-		return false
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
+	// FIX BUG2: Use curlRequest
+	statusCode, respBody, err := curlRequest(finalURL, method, headers, body, 15)
+	if err != nil || statusCode == 0 {
 		return false
 	}
-	defer resp.Body.Close()
 
-	b, _ := io.ReadAll(resp.Body)
-	return strings.Contains(string(b), payload)
+	return strings.Contains(string(respBody), payload)
 }
 
 func checkHeaderReflection(targetURL, headerName, headerValue string) bool {
@@ -1095,6 +1115,182 @@ func extractBreakChars(val string) []string {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// ── New helpers for curl_reflect_checker ──────────────────────────────────
+
+// extractReflectedURLsFromCurl parses the JSON-line output of curl_reflect_checker
+// and returns a slice of URLs that had a reflection (Sinks contains "body_reflection").
+func extractReflectedURLsFromCurl(output string) []string {
+	var urls []string
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var domOut DomSinkOutput
+		if err := json.Unmarshal([]byte(line), &domOut); err != nil {
+			continue
+		}
+		// Check if reflection was found
+		found := false
+		for _, sink := range domOut.Sinks {
+			if sink == "body_reflection" {
+				found = true
+				break
+			}
+		}
+		if found && domOut.URL != "" {
+			urls = append(urls, domOut.URL)
+		}
+	}
+	return urls
+}
+
+// aggregateCurlFindings adds findings from curl_reflect_checker output (already parsed as reflectedURLs)
+// to the report. It handles "get" and "json" phases with appropriate verification for JSON.
+func aggregateCurlFindings(report *VulnerabilityReport, reflectedURLs []string, phase string, targetBase string) {
+	if len(reflectedURLs) == 0 {
+		return
+	}
+
+	// Map to deduplicate by parameter name
+	paramMap := make(map[string]*Vulnerability)
+
+	for _, u := range reflectedURLs {
+		// Extract payload (canary) from URL
+		payload := reX9.FindString(u)
+		if payload == "" {
+			continue
+		}
+
+		// Parse URL to find which query parameter contains the payload
+		parsed, err := url.Parse(u)
+		if err != nil {
+			continue
+		}
+		var paramName string
+		for k, v := range parsed.Query() {
+			for _, val := range v {
+				if strings.Contains(val, payload) {
+					paramName = k
+					break
+				}
+			}
+			if paramName != "" {
+				break
+			}
+		}
+		if paramName == "" {
+			continue // cannot determine injection point
+		}
+
+		switch phase {
+		case "get":
+			// Add to QueryParameters directly (severity "likely")
+			if existing, ok := paramMap[paramName]; ok {
+				// Merge payloads
+				exists := false
+				for _, p := range existing.Payloads {
+					if p == payload {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					existing.Payloads = append(existing.Payloads, payload)
+				}
+				// Keep severity if it's already higher
+			} else {
+				paramMap[paramName] = &Vulnerability{
+					Name:      paramName,
+					Severity:  "likely",
+					Payloads:  []string{payload},
+					Confirmed: false,
+				}
+			}
+		case "json":
+			// For JSON, we need to verify via POST with JSON body.
+			// Build the clean target URL (without the query param containing the canary)
+			cleanURL := *parsed
+			q := cleanURL.Query()
+			q.Del(paramName)
+			cleanURL.RawQuery = q.Encode()
+			cleanTarget := cleanURL.String()
+
+			// Construct JSON body: {"paramName": "payload"}
+			jsonBody := fmt.Sprintf(`{"%s":"%s"}`, paramName, payload)
+
+			// Call verifyReflection (POST)
+			if !verifyReflection(cleanTarget, "POST", nil, jsonBody, payload) {
+				continue // skip if no reflection in POST
+			}
+
+			// Add to JSONBody
+			if existing, ok := paramMap[paramName]; ok {
+				exists := false
+				for _, p := range existing.Payloads {
+					if p == payload {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					existing.Payloads = append(existing.Payloads, payload)
+				}
+				// Ensure severity is "likely"
+				if existing.Severity != "likely" {
+					existing.Severity = "likely"
+				}
+			} else {
+				paramMap[paramName] = &Vulnerability{
+					Name:      paramName,
+					Severity:  "likely",
+					Payloads:  []string{payload},
+					Confirmed: false,
+				}
+			}
+		}
+	}
+
+	// Now append the deduplicated entries to the appropriate report slice
+	if len(paramMap) > 0 {
+		targetSlice := &report.QueryParameters
+		if phase == "json" {
+			targetSlice = &report.JSONBody
+		}
+		for _, vuln := range paramMap {
+			// Check if already exists in the report (by name)
+			found := false
+			for i, existing := range *targetSlice {
+				if existing.Name == vuln.Name {
+					// Merge payloads
+					for _, p := range vuln.Payloads {
+						exists := false
+						for _, ep := range existing.Payloads {
+							if ep == p {
+								exists = true
+								break
+							}
+						}
+						if !exists {
+							(*targetSlice)[i].Payloads = append((*targetSlice)[i].Payloads, p)
+						}
+					}
+					// Upgrade severity if needed
+					if severityWeight(vuln.Severity) > severityWeight(existing.Severity) {
+						(*targetSlice)[i].Severity = vuln.Severity
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				*targetSlice = append(*targetSlice, *vuln)
+			}
+		}
+	}
 }
 
 // ── processURL ──────────────────────────────────────────────────────────────
@@ -1291,7 +1487,13 @@ func processURL(targetURL string, index, total int) {
 				}
 
 				if domSinkCheckerExists {
-					res, _ := runCommand("./dom_sink_checker", "-l", pf)
+					res, err := runCommand("./dom_sink_checker", "-l", pf)
+					if err != nil {
+						logLine("DOMCHECK-ERR", X_red, "%s (%s): dom_sink_checker exited with error: %v", targetURL, pf, err)
+					} else if res == "" {
+						logLine("DOMCHECK-EMPTY", X_yellow, "%s (%s): dom_sink_checker ran but returned no output", targetURL, pf)
+					}
+
 					if res != "" {
 						lines := strings.Split(strings.TrimSpace(res), "\n")
 						for _, l := range lines {
@@ -1304,8 +1506,24 @@ func processURL(targetURL string, index, total int) {
 					}
 				}
 			} else {
-				res, _ := runCommand("nuclei", "-l", pf, "-t", canaryTemplate, "-silent")
-				p3Findings[probePhase] = append(p3Findings[probePhase], extractURLsFromNuclei(res)...)
+				// Phase 3: use curl_reflect_checker for GET and JSON probe files
+				if curlCheckerExists {
+					res, err := runCommand("./curl_reflect_checker", "-l", pf)
+					if err != nil {
+						logLine("CURLCHECK-ERR", X_red, "%s (%s): curl_reflect_checker exited with error: %v", targetURL, pf, err)
+					} else if res == "" {
+						logLine("CURLCHECK-EMPTY", X_yellow, "%s (%s): curl_reflect_checker ran but returned no output", targetURL, pf)
+					}
+					if res != "" {
+						reflectedURLs := extractReflectedURLsFromCurl(res)
+						probedCount := countLines(pf)
+						logLine("CURLCHECK-RESULT", X_cyan, "%s: %d URLs probed -> %d reflections found", pf, probedCount, len(reflectedURLs))
+						p3Findings[probePhase] = append(p3Findings[probePhase], reflectedURLs...)
+					}
+				} else {
+					logLine("WARN", X_yellow, "curl_reflect_checker not available, skipping reflection check for %s", pf)
+					// Fallback to nuclei if available? We'll skip to avoid false negatives, but we could log.
+				}
 			}
 		}
 	}
@@ -1320,7 +1538,13 @@ func processURL(targetURL string, index, total int) {
 		} else if !targetAlive {
 			domProbeSkippedAll = true
 		} else if domSinkCheckerExists {
-			res, _ := runCommand("./dom_sink_checker", "-l", domQueryProbeFile)
+			res, err := runCommand("./dom_sink_checker", "-l", domQueryProbeFile)
+			if err != nil {
+				logLine("DOMCHECK-ERR", X_red, "%s (%s): dom_sink_checker exited with error: %v", targetURL, domQueryProbeFile, err)
+			} else if res == "" {
+				logLine("DOMCHECK-EMPTY", X_yellow, "%s (%s): dom_sink_checker ran but returned no output", targetURL, domQueryProbeFile)
+			}
+
 			if res != "" {
 				lines := strings.Split(strings.TrimSpace(res), "\n")
 				for _, l := range lines {
@@ -1557,10 +1781,28 @@ func processURL(targetURL string, index, total int) {
 		finalX9Base := filepath.Join(outputDir, safeName(targetURL)+"-final-http")
 		runCommand("./x9", "-i", atkIn, "-json", "-headers", "-o", finalX9Base)
 
+		// Phase 4: use curl_reflect_checker for .get and .json attack files with -xss flag
 		exts := map[string]string{".get": "get", ".json": "json"}
 		for ext, ph := range exts {
-			if findings, _ := runCommand("nuclei", "-l", finalX9Base+ext, "-t", nucleiTemplate, "-silent"); findings != "" {
-				report.aggregateFindings(findings, ph)
+			atkFile := finalX9Base + ext
+			if _, statErr := os.Stat(atkFile); statErr == nil {
+				if curlCheckerExists {
+					res, err := runCommand("./curl_reflect_checker", "-l", atkFile, "-xss")
+					if err != nil {
+						logLine("CURLCHECK-ERR", X_red, "%s (%s): curl_reflect_checker exited with error: %v", targetURL, atkFile, err)
+					} else if res == "" {
+						logLine("CURLCHECK-EMPTY", X_yellow, "%s (%s): curl_reflect_checker ran but returned no output", targetURL, atkFile)
+					}
+					if res != "" {
+						reflectedURLs := extractReflectedURLsFromCurl(res)
+						probedCount := countLines(atkFile)
+						logLine("CURLCHECK-RESULT", X_cyan, "%s: %d URLs probed -> %d reflections found", atkFile, probedCount, len(reflectedURLs))
+						// Aggregate findings into report using our new helper
+						aggregateCurlFindings(&report, reflectedURLs, ph, targetURL)
+					}
+				} else {
+					logLine("WARN", X_yellow, "curl_reflect_checker not available, skipping Phase 4 reflection check for %s", atkFile)
+				}
 			}
 		}
 
@@ -1648,8 +1890,17 @@ func processURL(targetURL string, index, total int) {
 			os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(fragmentURLs), "\n")), 0644)
 			finalX9Base := filepath.Join(outputDir, safeName(targetURL)+"-final-dom")
 			runCommand("./x9", "-i", atkIn, "-dom", "-o", finalX9Base)
+
 			if domSinkCheckerExists {
-				if dom, _ := runCommand("./dom_sink_checker", "-xss", "-l", finalX9Base+".dom.attack", "-timeout", "300"); dom != "" {
+				atkFile := finalX9Base + ".dom.attack"
+				dom, err := runCommand("./dom_sink_checker", "-xss", "-l", atkFile, "-timeout", "300")
+				if err != nil {
+					logLine("DOMCHECK-ERR", X_red, "%s (%s): dom_sink_checker exited with error: %v", targetURL, atkFile, err)
+				} else if dom == "" {
+					logLine("DOMCHECK-EMPTY", X_yellow, "%s (%s): dom_sink_checker ran but returned no output", targetURL, atkFile)
+				}
+
+				if dom != "" {
 					report.aggregateFindings(dom, "dom_confirmed")
 				}
 			}
@@ -1684,8 +1935,16 @@ func processURL(targetURL string, index, total int) {
 			os.WriteFile(atkIn, []byte(strings.Join(dedupeConfirmedURLs(domQueryURLs), "\n")), 0644)
 			finalX9Base := filepath.Join(outputDir, safeName(targetURL)+"-final-dom-query")
 			runCommand("./x9", "-i", atkIn, "-o", finalX9Base)
+
 			if domSinkCheckerExists {
-				dom, _ := runCommand("./dom_sink_checker", "-xss", "-l", finalX9Base+".get", "-timeout", "300")
+				atkFile := finalX9Base + ".get"
+				dom, err := runCommand("./dom_sink_checker", "-xss", "-l", atkFile, "-timeout", "300")
+				if err != nil {
+					logLine("DOMCHECK-ERR", X_red, "%s (%s): dom_sink_checker exited with error: %v", targetURL, atkFile, err)
+				} else if dom == "" {
+					logLine("DOMCHECK-EMPTY", X_yellow, "%s (%s): dom_sink_checker ran but returned no output", targetURL, atkFile)
+				}
+
 				if dom != "" {
 					report.aggregateFindings(dom, "dom_confirmed")
 				}
@@ -1765,8 +2024,6 @@ func urlSignature(rawURL string) string {
 	sort.Strings(paramNames)
 	return path + "?" + strings.Join(paramNames, ",")
 }
-
-// NEW: Helper to calculate the total length of all query parameter values
 func queryValueLength(rawURL string) int {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -1845,7 +2102,7 @@ func main() {
 	flag.BoolVar(&allowWildcards, "allow-wildcards", false, "Allow wildcard URLs")
 	flag.BoolVar(&skipSPA, "skip-spa", true, "Skip SPA detection (if true, do not check for SPA)")
 	flag.IntVar(&phase, "phase", 4, "Pipeline phase to stop at (2, 3, or 4)")
-	// Add these to your var block in main()
+
 	rateLimitFlag := flag.Float64("rate", 1.0, "Requests per second per host")
 	hcIntervalFlag := flag.Duration("hc-interval", 5*time.Minute, "Proxy health-check interval")
 	hcTimeoutFlag := flag.Duration("hc-timeout", 5*time.Second, "Proxy health-check timeout")
@@ -1874,6 +2131,13 @@ func main() {
 		domSinkCheckerExists = true
 	} else {
 		logLine("WARN", X_yellow, "dom_sink_checker not found or not executable — DOM phases will be skipped")
+	}
+
+	// NEW: detect curl_reflect_checker
+	if _, err := exec.LookPath("./curl_reflect_checker"); err == nil {
+		curlCheckerExists = true
+	} else {
+		logLine("WARN", X_yellow, "curl_reflect_checker not found or not executable — GET/JSON reflection checks will be skipped")
 	}
 
 	loadEnv()
