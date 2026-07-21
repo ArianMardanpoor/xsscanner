@@ -7,9 +7,10 @@ results/
 x9
 xsscanner
 xssniper
+curl_reflect_checker
 #programs
 *.txt
-
+all_scanned_targets.txt
 
 
 .env
