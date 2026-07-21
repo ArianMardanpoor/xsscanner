@@ -262,7 +262,8 @@ func countLinesInDir(dir string) int {
 }
 
 // runIngest runs the python database ingestion script per target
-func runIngest(hostname string) {
+// FIX BUG1: Modified runIngest to return bool to signal success/failure to the caller.
+func runIngest(hostname string) bool {
 	// 1. تنظیم مسیر پایتون با بررسی وجود فایل (os.Stat)
 	pythonPath := os.Getenv("WATCHTOWER_PYTHON")
 	if pythonPath == "" {
@@ -316,17 +317,85 @@ func runIngest(hostname string) {
 
 	if err := cmd.Run(); err != nil {
 		logMsg(fmt.Sprintf("ingest_results.py failed for %s: %v\nStderr: %s", hostname, err, strings.TrimSpace(stderrBuf.String())), M_red)
+		return false
 	} else {
 		outStr := strings.TrimSpace(stdoutBuf.String())
 		if outStr != "" {
 			logMsg(outStr, M_green)
 		}
+		return true
+	}
+}
+
+// FIX BUG2: Added struct and function for JSONL cleanup audit log and output deletion
+type CleanupAuditEntry struct {
+	Timestamp   string   `json:"timestamp"`
+	Target      string   `json:"target"`
+	Directory   string   `json:"directory"`
+	FileCount   int      `json:"file_count"`
+	TotalBytes  int64    `json:"total_bytes"`
+	Removed     bool     `json:"removed"`
+	Error       string   `json:"error,omitempty"`
+	SampleFiles []string `json:"sample_files,omitempty"`
+}
+
+func cleanupTargetOutput(target, dirPath string) {
+	var fileCount int
+	var totalBytes int64
+	var sampleFiles []string
+
+	// 1. Walk directory to collect metrics before deletion
+	_ = filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() {
+			fileCount++
+			totalBytes += info.Size()
+			if len(sampleFiles) < 10 {
+				sampleFiles = append(sampleFiles, info.Name())
+			}
+		}
+		return nil
+	})
+
+	// 2. Remove directory entirely
+	removeErr := os.RemoveAll(dirPath)
+
+	// 3. Append JSON line to audit log
+	entry := CleanupAuditEntry{
+		Timestamp:   time.Now().Format(time.RFC3339),
+		Target:      target,
+		Directory:   dirPath,
+		FileCount:   fileCount,
+		TotalBytes:  totalBytes,
+		Removed:     removeErr == nil,
+		SampleFiles: sampleFiles,
+	}
+	if removeErr != nil {
+		entry.Error = removeErr.Error()
+	}
+
+	auditFile := filepath.Join(globalOutputDir, "cleanup_audit.jsonl")
+	if f, err := os.OpenFile(auditFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+		if b, errMarshal := json.Marshal(entry); errMarshal == nil {
+			f.Write(append(b, '\n'))
+		}
+		f.Close()
+	}
+
+	// 4. Log summary status
+	if removeErr == nil {
+		mb := float64(totalBytes) / (1024 * 1024)
+		logMsg(fmt.Sprintf("Cleanup: removed %d files (%.2f MB) for %s", fileCount, mb, target), M_green)
+	} else {
+		logMsg(fmt.Sprintf("Cleanup FAILED for %s: %v", target, removeErr), M_red)
 	}
 }
 
 // ── تابع پردازش هدف (Sequential Waterfall) ─────────────────────────────────
 
-func processTarget(target string, isSingleTarget bool, skipSPA bool, noCrawl bool, phase int, domScan bool) {
+func processTarget(target string, isSingleTarget bool, skipSPA bool, noCrawl bool, phase int, domScan bool, useKatana bool) {
 	logMsg(fmt.Sprintf("--- Starting: %s ---", target), M_purple+M_bold)
 
 	u, err := url.Parse(target)
@@ -345,6 +414,10 @@ func processTarget(target string, isSingleTarget bool, skipSPA bool, noCrawl boo
 	katanaDir := filepath.Join(globalOutputDir, "katana")
 	paramsDir := filepath.Join(globalOutputDir, "params")
 
+	// FIX BUG3: Create per-target xssniper isolation directory
+	xssniperOutDir := filepath.Join(globalOutputDir, "xssniper_out", safeURL)
+	os.MkdirAll(xssniperOutDir, 0755)
+
 	os.MkdirAll(passiveDir, 0755)
 	os.MkdirAll(katanaDir, 0755)
 	os.MkdirAll(paramsDir, 0755)
@@ -354,31 +427,35 @@ func processTarget(target string, isSingleTarget bool, skipSPA bool, noCrawl boo
 
 	if !noCrawl {
 		// STEP 1: Passive discovery (must finish before anything else starts)
-		logMsg(fmt.Sprintf("[1/3] Running nice_passive for %s", target), M_gray)
+		logMsg(fmt.Sprintf("[1/2] Running nice_passive for %s", target), M_gray)
 		if err := runBinary("./nice_passive", "-o", passiveDir, hostname); err != nil {
 			logMsg(fmt.Sprintf("nice_passive failed for %s: %v", target, err), M_red)
 		}
 
-		// STEP 2: Katana runs ONLY on the unique output of passive phase
-		if countLines(passiveOutFile) > 0 {
-			if spadetect.IsSPA(target) {
-				logMsg(fmt.Sprintf("[SKIP-SPA] %s: SPA detected, skipping katana crawl", target), M_cyan)
-			} else {
-				logMsg(fmt.Sprintf("[2/3] Running nice_katana on passive results for %s", target), M_gray)
-				if err := runBinary("./nice_katana", "-o", katanaDir, passiveOutFile); err != nil {
-					logMsg(fmt.Sprintf("nice_katana failed for %s: %v", target, err), M_red)
+		// STEP 2: Katana is OPT-IN ONLY (-use-katana). Default: skipped entirely.
+		if useKatana {
+			if countLines(passiveOutFile) > 0 {
+				if spadetect.IsSPA(target) {
+					logMsg(fmt.Sprintf("[SKIP-SPA] %s: SPA detected, skipping katana crawl", target), M_cyan)
+				} else {
+					logMsg(fmt.Sprintf("[2/2] Running nice_katana on passive results for %s", target), M_gray)
+					if err := runBinary("./nice_katana", "-o", katanaDir, passiveOutFile); err != nil {
+						logMsg(fmt.Sprintf("nice_katana failed for %s: %v", target, err), M_red)
+					}
 				}
+			} else {
+				logMsg(fmt.Sprintf("No passive URLs found for %s, skipping Katana", target), M_gray)
 			}
 		} else {
-			logMsg(fmt.Sprintf("No passive URLs found for %s, skipping Katana", target), M_gray)
+			logMsg(fmt.Sprintf("Katana disabled (pass -use-katana to enable), skipping crawl for %s", target), M_gray)
 		}
 
-		// STEP 3: Params runs only after Katana is fully done
-		logMsg(fmt.Sprintf("[3/3] Running nice_params for %s", target), M_gray)
+		// STEP 3: Params always runs (independent of katana)
+		logMsg(fmt.Sprintf("Running nice_params for %s", target), M_gray)
 		if err := runBinary("./nice_params", "-u", target, "-d", paramsDir); err != nil {
 			logMsg(fmt.Sprintf("nice_params failed for %s: %v", target, err), M_red)
 		}
-	} // پایان شرط if !noCrawl
+	}
 
 	// Aggregate results and run xssniper
 	logMsg(fmt.Sprintf("Launching XSSniper for %s", target), M_cyan)
@@ -424,7 +501,8 @@ func processTarget(target string, isSingleTarget bool, skipSPA bool, noCrawl boo
 		}
 	}
 
-	args := []string{"-l", jobFile, "-p", paramFilePath, "-w", "3"}
+	// FIX BUG4: Append isolated output directory parameter dynamically
+	args := []string{"-l", jobFile, "-p", paramFilePath, "-w", "3", "-o", xssniperOutDir}
 	if isSingleTarget {
 		args = append(args, "-u", target)
 	}
@@ -440,7 +518,14 @@ func processTarget(target string, isSingleTarget bool, skipSPA bool, noCrawl boo
 	runBinary("./xssniper", args...)
 
 	// پایپ‌لاین اینجکشن دیتابیس بلافاصله پس از اتمام کار xssniper
-	runIngest(hostname)
+	// FIX BUG5: Capture status and conditionally clean up the output dir
+	ingestOK := runIngest(hostname)
+
+	if ingestOK {
+		cleanupTargetOutput(target, xssniperOutDir)
+	} else {
+		logMsg(fmt.Sprintf("Cleanup skipped for %s: database ingestion failed", target), M_red)
+	}
 
 	// مارک کردن تارگت به عنوان اسکن شده
 	markAsScanned(target)
@@ -459,6 +544,7 @@ func main() {
 	noCrawl := flag.Bool("no-crawl", false, "Skip passive and katana crawling entirely")
 	phase := flag.Int("phase", 4, "Pipeline phase to stop at (2, 3, or 4)")
 	domScan := flag.Bool("dom-scan", false, "Enable DOM/headless sink checks (passed through to xssniper; slow, off by default)")
+	useKatana := flag.Bool("use-katana", false, "Run nice_katana crawl step (slow; off by default, only passive+params run otherwise)")
 	flag.Parse()
 
 	// STEP 1: Capture terminal output to temp file explicitly via logWriter
@@ -530,7 +616,7 @@ func main() {
 
 	logMsg(fmt.Sprintf("Ready to process %d targets in %s mode.", len(newTargets), strings.ToUpper(modeStr)), M_cyan)
 	for _, target := range newTargets {
-		processTarget(target, isSingleTarget, *skipSPA, *noCrawl, *phase, *domScan)
+		processTarget(target, isSingleTarget, *skipSPA, *noCrawl, *phase, *domScan, *useKatana)
 	}
 
 	mdPath := "results/TARGET_REPORT.md"
