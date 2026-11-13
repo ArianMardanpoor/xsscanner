@@ -1,0 +1,20 @@
+# Compiled binaries (produced by build.sh).
+# results/ is blanket-ignored below, so results/discovery/ and
+# results/crawl_cache/ (the new xsscanner_discover output paths) need no
+# separate entry here — they are covered by the results/ rule.
+nice_passive
+nice_katana
+nice_params
+x9
+xssniper
+xsscanner
+xsscanner_discover
+dom_sink_checker
+curl_reflect_checker
+
+# Scan output (per-target discovery files, crawl cache, param maps, reports).
+results/
+
+# Go workspace artifacts (no vendor dir is currently committed; if one is
+# added later, uncomment the next line).
+# vendor/
