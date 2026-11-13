@@ -1,8 +1,10 @@
+// nice_katana.go
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -68,11 +70,18 @@ func main() {
 	if flag.NArg() > 0 {
 		arg := flag.Arg(0)
 		if info, err := os.Stat(arg); err == nil && !info.IsDir() {
-			file, _ := os.Open(arg)
+			// FIX: file existence is now checked (Stat error previously
+			// dropped on the floor) — a non-existent "domains.txt" argument
+			// is treated as a literal single target, matching the usage line.
+			file, ferr := os.Open(arg)
+			if ferr != nil {
+				fmt.Printf("Error opening target file %s: %v\n", arg, ferr)
+				return
+			}
 			scanner := bufio.NewScanner(file)
 			for scanner.Scan() {
 				val := strings.TrimSpace(scanner.Text())
-				if val != "" {
+				if val != "" && !strings.HasPrefix(val, "#") {
 					targets = append(targets, val)
 				}
 			}
@@ -86,7 +95,7 @@ func main() {
 			scanner := bufio.NewScanner(os.Stdin)
 			for scanner.Scan() {
 				val := strings.TrimSpace(scanner.Text())
-				if val != "" {
+				if val != "" && !strings.HasPrefix(val, "#") {
 					targets = append(targets, val)
 				}
 			}
@@ -188,17 +197,19 @@ func runNiceKatanaBatch(targets []string, outDir string, verbose bool, authCooki
 
 	cmd := exec.Command("katana", ctxArgs...)
 
-	// گرفتن خروجی Stderr و (در حالت verbose) Stdout. قبلاً Stdout هرگز به
-	// چیزی متصل نبود و مسیر موفقیت (exit 0 با خروجی صفر) هیچ دیدابیلیتی
-	// نداشت — مثلاً اگر کاتانا با فلگ اشتباه exit 0 با 0 URL برمی‌گرداند،
-	// هیچ لاگی چاپ نمی‌شد. حالا در حالت verbose، Stdout هم گرفته می‌شود تا
-	// دیباگ آینده بدون نیاز به ابزار اضافی ممکن باشد.
+	// گرفتن خروجی Stderr و (در حالت verbose) Stdout.
+	//
+	// FIX (data race / fd leak): قبلاً cmd.Stdout فقط در حالت verbose به
+	// stdoutBuf وصل می‌شد؛ در حالت non-verbose با exit غیرصفر، اگر کاتانا
+	// حجم زیادی روی stdout بنویسد، هیچ کسی آن را نمی‌خواند و pipe پر می‌شود
+	// (64KB) و خود کاتانا روی write بلاک می‌شود — عملاً همان قفل‌شدنی که
+	// قرار بود timeout حلش کند، به‌صورت بن‌بست. حالا stdout همیشه به یک
+	// بافر درون‌حافظه‌ای متصل است (در non-verbose دور ریخته می‌شود، فقط
+	// stderr چاپ می‌شود) و هیچ جریانی بدون خواننده نمی‌ماند.
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 	var stdoutBuf bytes.Buffer
-	if verbose {
-		cmd.Stdout = &stdoutBuf
-	}
+	cmd.Stdout = &stdoutBuf
 
 	// نمایش دستور کامل در حالت verbose
 	if verbose {
@@ -211,52 +222,60 @@ func runNiceKatanaBatch(targets []string, outDir string, verbose bool, authCooki
 	}
 
 	start := time.Now()
-	done := make(chan error, 1)
-	go func() { done <- cmd.Run() }()
+	// FIX (synchronous kill + racy timeout log): قبلاً cmd.Run() داخل
+	// goroutine صدا زده می‌شد و در مسیر timeout فقط cmd.Process.Kill()
+	// می‌شد بدون آنکه exit منتظر بماند — لاگ summary مسیر timeout هم
+	// time.Since(start) را می‌گرفت که عملاً همیشه ~timeoutDuration بود
+	// (مدت واقعیِ کشته‌شدن گزارش نمی‌شد). حالا از exec.CommandContext
+	// استفاده می‌کنیم: Go خودش با انقضای context کل process tree را
+	// می‌کشد (katana احتمالاً فرزند ندارد ولی این روش برای هر ابزار
+	// خارجی امن‌تر است) و Run() همیشه سینکرون برمی‌گردد؛ دیگر هیچ
+	// goroutine یتیم و هیچ kill رقابتی وجود ندارد.
+	cmdCtx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
+	defer cancel()
+	cmd = exec.CommandContext(cmdCtx, "katana", ctxArgs...)
+	cmd.Stderr = &stderrBuf
+	cmd.Stdout = &stdoutBuf
 
-	select {
-	case err := <-done:
-		duration := time.Since(start)
-		if err != nil {
-			fmt.Printf("Error running katana batch: %v\n", err)
-			// در صورت خطا، محتوای Stderr به طور کامل چاپ می‌شود
-			if stderrBuf.Len() > 0 {
-				fmt.Printf("Katana Stderr:\n%s\n", stderrBuf.String())
-			}
-			// Print stdout too in verbose so a flag-parsing error
-			// (e.g. unsupported -jsluice) is visible even when katana
-			// exits non-zero with helpful text on stdout instead of stderr.
-			if verbose && stdoutBuf.Len() > 0 {
-				fmt.Printf("Katana Stdout:\n%s\n", stdoutBuf.String())
-			}
-			fmt.Printf("%sdone for batch, results: 0 (katana exited non-zero after %s; jsluice=%v)%s\n", gray, duration.Round(time.Second), jsluiceApplied, reset)
-			return
-		}
-		// On the clean-exit path, also surface katana's own stdout in
-		// verbose mode + always report duration and jsluice-applied status
-		// in the completion summary (spec Bug 2 Step 4).
-		if verbose && stdoutBuf.Len() > 0 {
-			fmt.Printf("%s[VERBOSE] Katana Stdout:%s\n%s\n", gray, reset, stdoutBuf.String())
-		}
-		if verbose && stderrBuf.Len() > 0 {
-			fmt.Printf("%s[VERBOSE] Katana Stderr:%s\n%s\n", gray, reset, stderrBuf.String())
-		}
-		_ = duration // reported in the summary line below
-	case <-time.After(timeoutDuration):
-		duration := time.Since(start)
-		fmt.Printf("%skatana timed out for batch after %v, killing process (jsluice=%v, duration=%s)%s\n", gray, timeoutDuration, jsluiceApplied, duration.Round(time.Second), reset)
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-		// On timeout, also surface whatever katana printed before being
-		// killed — both streams, only in verbose (avoids noise in normal runs).
+	runErr := cmd.Run()
+	duration := time.Since(start)
+
+	if cmdCtx.Err() == context.DeadlineExceeded {
+		// Timeout: خروجی‌هایی که کاتانا تا لحظه‌ی کشته‌شدن چاپ کرده بود
+		// (فقط در verbose، تا نویز حالت عادی حفظ شود).
 		if verbose && stderrBuf.Len() > 0 {
 			fmt.Printf("%s[VERBOSE] Katana Stderr (pre-timeout):%s\n%s\n", gray, reset, stderrBuf.String())
 		}
 		if verbose && stdoutBuf.Len() > 0 {
 			fmt.Printf("%s[VERBOSE] Katana Stdout (pre-timeout):%s\n%s\n", gray, reset, stdoutBuf.String())
 		}
+		fmt.Printf("%skatana timed out for batch after %v, killing process (jsluice=%v, duration=%s)%s\n", gray, timeoutDuration, jsluiceApplied, duration.Round(time.Second), reset)
 		return
+	}
+
+	if runErr != nil {
+		fmt.Printf("Error running katana batch: %v\n", runErr)
+		// در صورت خطا، محتوای Stderr به طور کامل چاپ می‌شود
+		if stderrBuf.Len() > 0 {
+			fmt.Printf("Katana Stderr:\n%s\n", stderrBuf.String())
+		}
+		// Print stdout too in verbose so a flag-parsing error
+		// (e.g. unsupported -jsluice) is visible even when katana
+		// exits non-zero with helpful text on stdout instead of stderr.
+		if verbose && stdoutBuf.Len() > 0 {
+			fmt.Printf("Katana Stdout:\n%s\n", stdoutBuf.String())
+		}
+		fmt.Printf("%sdone for batch, results: 0 (katana exited non-zero after %s; jsluice=%v)%s\n", gray, duration.Round(time.Second), jsluiceApplied, reset)
+		return
+	}
+	// On the clean-exit path, also surface katana's own stdout in
+	// verbose mode + always report duration and jsluice-applied status
+	// in the completion summary (spec Bug 2 Step 4).
+	if verbose && stdoutBuf.Len() > 0 {
+		fmt.Printf("%s[VERBOSE] Katana Stdout:%s\n%s\n", gray, reset, stdoutBuf.String())
+	}
+	if verbose && stderrBuf.Len() > 0 {
+		fmt.Printf("%s[VERBOSE] Katana Stderr:%s\n%s\n", gray, reset, stderrBuf.String())
 	}
 
 	file, _ := os.Open(katanaOutput)
@@ -299,6 +318,15 @@ func runNiceKatanaBatch(targets []string, outDir string, verbose bool, authCooki
 	// On uro failure (e.g. binary not installed), log a warning and keep
 	// the un-deduped katanaOutput as-is — never abort the run over this
 	// (same error-tolerance pattern as everywhere else in this pipeline).
+	//
+	// FIX (partial output + fsync-before-uro): کاتانا با -o مستقیم روی
+	// katanaOutput می‌نویسد؛ حتی بعد از return شدن فرآیند، بافرهای فایل
+	// سیستم ممکن است فلش نشده باشند (به‌خصوص روی فایل‌سیستم‌های توزیع‌شده).
+	// قبلاً uro بلافاصله همان فایل را می‌خواند. یک fsync صریح روی fd بسته‌شده
+	// ممکن نیست، پس قبل از خواندن/uro یک فایل sync syscall روی دایرکتوری
+	// outDir می‌زنیم (عملی‌ترین راهِ در دسترس بدون بازکردن مجدد) و بعد
+	// همان قبلی: uro روی همان مسیر اجرا می‌شود.
+	syncDir(outDir)
 	preCount := count
 	dedupPath := katanaOutput + ".deduped"
 	dedupCmd := exec.Command("uro", "-i", katanaOutput, "-o", dedupPath)
@@ -335,4 +363,17 @@ func runNiceKatanaBatch(targets []string, outDir string, verbose bool, authCooki
 
 	fmt.Printf("%sdone for batch, results: %d saved to %s (jsluice=%v, duration=%s)%s\n",
 		gray, count, katanaOutput, jsluiceApplied, time.Since(start).Round(time.Second), reset)
+}
+
+// syncDir best-effort fsync of a directory so entries created/renamed inside
+// it (katanaOutput, the .deduped temp) are durable before another process
+// (uro, or xsscanner's staging-file rename) reads them. Failures are ignored
+// (fsync on a dir is not supported everywhere, e.g. some network mounts).
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	d.Sync()
+	d.Close()
 }
