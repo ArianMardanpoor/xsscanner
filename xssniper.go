@@ -1904,10 +1904,25 @@ func processURLFast(targetURL string, index, total int) ProbeArtifacts {
 
         logLine("TARGET", X_white, "[%d/%d | Vulns: %d] %s", currProcessed, total, currVulns, targetURL)
 
+        // SPA detection (Bug 2 fix): an SPA-detected page used to be dropped
+        // ENTIRELY here (art.Skip = true; return) — 100% of the scan,
+        // including the cheap Phase 1-3 reflection/canary sweep that finds
+        // real reflected XSS on any page. Now SPA detection degrades
+        // gracefully instead:
+        //   - Phases 1-3 (x9 probe files + curl reflection sweep + confirm)
+        //     always run — reflected/breakout XSS is just as findable on a
+        //     client-rendered page;
+        //   - only the header-injection sub-phases are reduced for detected
+        //     SPAs, by merging the detection into the tech profile so the
+        //     pre-existing profile.IsSPA SKIP-TECH logic applies (see the
+        //     probeFiles loop and Phase 4 below); -force-all still overrides
+        //     that exactly as before.
+        // Do not silently drop 100% of scanning just because the SPA
+        // heuristic fired.
+        isSPADetected := false
         if !skipSPA && spadetect.IsSPA(targetURL) {
-                logLine("SKIP", X_yellow, "SPA/React detected, skipping heavy scan for %s", targetURL)
-                art.Skip = true
-                return art
+                isSPADetected = true
+                logLine("SPA", X_cyan, "SPA detected for %s — reflection scan continues; only header-injection stages are reduced (-force-all overrides)", targetURL)
         }
 
         if isGenericReflector(targetURL) {
@@ -1918,6 +1933,12 @@ func processURLFast(targetURL string, index, total int) ProbeArtifacts {
 
         techListStr := strings.Split(techFlag, ",")
         profile := classifyTechProfile(techListStr)
+        if isSPADetected && !forceAll {
+                // Merge the runtime SPA detection into the tech profile so
+                // the existing SPA-conditional header-injection skips apply.
+                profile.IsSPA = true
+                profile.Unknown = false
+        }
         art.Profile = profile
 
         report := VulnerabilityReport{URL: targetURL}

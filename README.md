@@ -1,18 +1,25 @@
-# xsscanner — deliverables (change 4: x8 removal / fallparams-only + chunked testing)
+# xsscanner — deliverables (change 5: Bug 1 + Bug 2 fixes — fallparams output capture & SPA false-positives)
 
-This change rebuilds the discovery and param-testing pipeline. x8 is gone
-entirely; fallparams is the only server-side parameter-discovery engine; and
-the final test phase tests every discovered path against fixed-size chunks of
-the target-wide parameter set instead of the old per-path own/all scopes.
+This change fixes two confirmed, evidence-based bugs in the discovery /
+parameter-phase pipeline. Both were reproduced against the real target
+(webapp.nozbe.com) with real binaries before fixing, and re-verified after
+(see `BUGFIX_NOTES.md` for the full before/after evidence).
 
 | File | What it is |
 |---|---|
-| `main.go` | xsscanner main — chunked test loop, `-chunk` flag, fallparams flag forwarding, query-string harvesting |
-| `nice_params.go` | fallparams-only param discovery (x8 removed); `-fallparams-depth` / `-fallparams-crawl-duration` flags |
-| `pkg/discoveryutil/discoveryutil.go` | `MergeAndFilter` + final uro-style semantic dedup pass (path + param-name set) |
-| `xssniper.go` | unchanged — still consumes `-p <paramFile>`; only the file's content changed (a chunk instead of own/all) |
-| `nice_passive.go` / `xsscanner_discover.go` | unchanged — both automatically benefit from the shared `discoveryutil.MergeAndFilter` semantic dedup |
-| `pkg/reporter/reporter.go` | unchanged — `Scope` in waf-blocked.json now carries the chunk key instead of own/all |
+| `nice_params.go` | **FIXED (Bug 1)** — `runFallparams()` now passes an explicit `-o <runDir>/parameters.txt` and parses BOTH output channels (file + stdout), with a loud warning when both are empty |
+| `pkg/spadetect/spadetect.go` | **FIXED (Bug 2)** — `AnalyzeSPA()` (new pure function; `IsSPA()` wraps it): low visible-text alone no longer classifies a page as SPA; it now requires a corroborating signal (framework marker / empty-app-shell structure / x-powered-by). Markers alone remain sufficient |
+| `main.go` | **FIXED (Bug 2.3)** — SPA detection no longer skips the katana crawl (`[SPA-NOTICE]` + crawl continues; form-fill discovery runs on SPAs too); everything else in the chunked pipeline unchanged |
+| `xsscanner_discover.go` | **FIXED (Bug 2.3)** — same katana-skip removal as `main.go` |
+| `xssniper.go` | **FIXED (Bug 2.3)** — `processURLFast` no longer drops 100% of the scan for SPA-detected pages: Phases 1-3 (reflection/canary sweep + confirm) always run; only header-injection sub-phases are reduced (merged into the existing `profile.IsSPA` SKIP-TECH logic; `-force-all` still overrides) |
+| `fallparams_test.go` | **NEW** — stub-fallparams integration tests: file-channel, stdout-channel (the Bug 1 scenario verbatim), both-channels union, no-output, and the exact flag contract (invocation flags unchanged + explicit `-o`) |
+| `pkg/spadetect/spadetect_test.go` | **NEW** — SPA regression tests: webapp.nozbe.com login-page HTML → NOT SPA; minimal SPA → SPA; markers stay sufficient; low-text-alone never sufficient; empty-app-shell conjunction still fires; x-powered-by corroboration still works |
+
+Change 4's table (still accurate for everything not touched here):
+`pkg/discoveryutil/discoveryutil.go` — `MergeAndFilter` + uro-style semantic
+dedup; `nice_passive.go` — unchanged; `pkg/reporter/reporter.go` — unchanged
+(`Scope` in waf-blocked.json carries the chunk key). Payload generation,
+WAF/block-guard counter logic, chunking, and pkg/reflectctx are all untouched.
 
 ## What changed
 

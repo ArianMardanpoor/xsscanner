@@ -1218,9 +1218,20 @@ func processTarget(target string, skipSPA bool, noCrawl bool, phase int, domScan
                         // not sequential inputs to each other. (Previously this fed
                         // passiveOutFile as katana's seed list, which re-crawled every
                         // passively-discovered endpoint as a starting point — wrong.)
+                        //
+                        // BUG FIX (SPA no longer skips katana): an SPA classification used
+                        // to skip the katana crawl entirely. That all-or-nothing behavior
+                        // threw away katana's -automatic-form-fill discovery — the only
+                        // mechanism here that finds parameters living exclusively in HTML
+                        // <form> inputs (no query string anywhere) — which is exactly as
+                        // valuable on SPAs (client-side-rendered forms still POST to classic
+                        // endpoints). SPA detection now only logs a notice; the crawl
+                        // (including form-fill) always runs unless disabled by flag or
+                        // already completed and cached.
                         if spadetect.IsSPA(target) {
-                                logMsg(fmt.Sprintf("[SKIP-SPA] %s: SPA detected, skipping katana crawl", target), M_cyan)
-                        } else if fileExists(katanaOutFile) && fileExists(katanaOutFile+".done") && !force {
+                                logMsg(fmt.Sprintf("[SPA-NOTICE] %s: SPA detected — katana crawl continues anyway (form-fill parameter discovery is valuable on SPAs too)", target), M_cyan)
+                        }
+                        if fileExists(katanaOutFile) && fileExists(katanaOutFile+".done") && !force {
                                 logMsg(fmt.Sprintf("[CACHE-SKIP katana] %s — nice_katana already completed for this target, reusing %s", target, filepath.Base(katanaOutFile)), M_green)
                         } else {
                                 logMsg(fmt.Sprintf("[2/3] Running nice_katana on input target for %s", target), M_gray)

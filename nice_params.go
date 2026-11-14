@@ -435,6 +435,27 @@ func isCandidateWord(w string) bool {
 //     fallparams is lighter than the old x8 flow, but its crawl can still run
 //     long; two minutes bounds the per-URL phase cost while leaving enough
 //     time for a depth-2 crawl. 0 disables the flag (fallparams default).
+//   - -o <runDir>/parameters.txt: output file, passed EXPLICITLY. fallparams
+//     documents -o/-output in its -h ("File to write output to", default
+//     "parameters.txt"). This is load-bearing: fallparams v1.0.12's runner
+//     (funcs/run/runner.go) only appends to the output file when
+//     OutputFile != "parameters.txt" || !SilentMode — with -silent and the
+//     DEFAULT filename it prints params to stdout only and NEVER writes the
+//     file. The old code read a hardcoded runDir/parameters.txt without
+//     passing -o, so in -silent mode (always passed here) the file never
+//     existed and runFallparams silently returned zero params for EVERY
+//     target. Passing -o explicitly pins the exact path we then read, and
+//     makes the file channel work even in -silent mode.
+//
+// Output capture (the Bug 1 fix): fallparams' output channel depends on its
+// flags/version. Instead of assuming one channel, BOTH are captured and
+// merged (deduped, first-seen order):
+//   1. the -o output file (read from the exact path we passed);
+//   2. fallparams' combined stdout+stderr (CombinedOutput) — one candidate
+//      per line, same line-oriented format as the file channel.
+// If BOTH channels are empty the function logs a LOUD warning (even in
+// silent mode, via stderr) so "the tool produced nothing" is always
+// distinguishable in the logs from "the target has no parameters".
 //
 // Global auth headers (-cookie/-header) are forwarded IF the installed
 // fallparams advertises a custom-header flag; otherwise a one-time warning and
@@ -454,8 +475,12 @@ func runFallparams(ctx context.Context, rawURL string, silent bool, crawl bool, 
 	}
 	registerTemp(runDir)
 
+	// The exact output path we tell fallparams to write (-o). Never assume a
+	// hardcoded default filename — we pass the flag and read this same path.
+	fallOutPath := filepath.Join(runDir, "parameters.txt")
+
 	// -silent: bypasses the ShowBanner panic in fallparams v1.0.12
-	args := []string{"-u", rawURL, "-silent"}
+	args := []string{"-u", rawURL, "-silent", "-o", fallOutPath}
 	if crawl {
 		// Always-on in production: crawl is the discovery engine.
 		args = append(args, "-crawl")
@@ -495,18 +520,63 @@ func runFallparams(ctx context.Context, rawURL string, silent bool, crawl bool, 
 		printWarning(fmt.Sprintf("fallparams exited with error: %v\n%s", runErr, string(out)))
 	}
 
-	fallOutPath := filepath.Join(runDir, "parameters.txt")
-	content, err := os.ReadFile(fallOutPath)
-	if err != nil {
+	// ── Channel 1: the -o output file (authoritative when present) ──────────
+	var fileCandidates []string
+	fileContent, fileErr := os.ReadFile(fallOutPath)
+	if fileErr == nil {
+		fileCandidates = extractCandidates(string(fileContent))
+	} else if !os.IsNotExist(fileErr) {
+		// Exists but unreadable is a real I/O problem worth surfacing.
 		if !silent {
-			printInfo("fallparams: no output file found")
+			printWarning(fmt.Sprintf("fallparams: output file %s unreadable: %v", fallOutPath, fileErr))
 		}
-		return nil, nil
 	}
 
+	// ── Channel 2: fallparams' stdout+stderr (CombinedOutput) ────────────────
+	// With -silent, fallparams prints one parameter per line to stdout (its
+	// documented -silent behavior). The same line-oriented extraction applies.
+	stdoutCandidates := extractCandidates(string(out))
+
+	// Union both channels, deduped, first-seen order (file channel first —
+	// it is the channel we explicitly requested via -o).
+	candidates := mergeCandidateLists(fileCandidates, stdoutCandidates)
+
+	// ── Loud no-output warning ────────────────────────────────────────────────
+	// A silent "no params found" is indistinguishable from "we parsed the
+	// tool's output wrong". If BOTH channels yielded nothing AND the file was
+	// never written, make the distinction loud — even in otherwise-silent
+	// runs (stderr is the machine-friendly channel nice_params reserves for
+	// exactly this kind of operational diagnostic).
+	if len(candidates) == 0 {
+		w := fmt.Sprintf("[nice_params] WARNING: fallparams produced NO output for %s — neither the -o file (%s; exists=%t) nor stdout had any parameter lines", rawURL, fallOutPath, fileErr == nil)
+		if runErr != nil {
+			w += fmt.Sprintf("; fallparams exited with error: %v", runErr)
+		}
+		if !silent {
+			printWarning(w)
+		} else {
+			logErrorMsg(w)
+		}
+	}
+
+	if !silent {
+		if len(candidates) > 0 {
+			printSuccess(fmt.Sprintf("fallparams: %d parameter(s) discovered (file channel: %d, stdout channel: %d)", len(candidates), len(fileCandidates), len(stdoutCandidates)))
+		} else {
+			printInfo("fallparams: no parameters found")
+		}
+	}
+	return candidates, nil
+}
+
+// extractCandidates parses one-candidate-per-line text (a fallparams output
+// channel — file or stdout) into a cleaned, deduped candidate list. This is
+// the same per-line cleaning the old code applied to file contents only; it
+// now backs BOTH channels.
+func extractCandidates(content string) []string {
 	var candidates []string
 	seen := make(map[string]bool)
-	sc := bufio.NewScanner(strings.NewReader(string(content)))
+	sc := bufio.NewScanner(strings.NewReader(content))
 	for sc.Scan() {
 		w := strings.TrimSpace(sc.Text())
 		w = cleanParam(w)
@@ -515,15 +585,22 @@ func runFallparams(ctx context.Context, rawURL string, silent bool, crawl bool, 
 			candidates = append(candidates, w)
 		}
 	}
+	return candidates
+}
 
-	if !silent {
-		if len(candidates) > 0 {
-			printSuccess(fmt.Sprintf("fallparams: %d parameter(s) discovered", len(candidates)))
-		} else {
-			printInfo("fallparams: no parameters found")
+// mergeCandidateLists unions two candidate lists, deduped, first-seen order.
+func mergeCandidateLists(a, b []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, list := range [][]string{a, b} {
+		for _, w := range list {
+			if !seen[w] {
+				seen[w] = true
+				out = append(out, w)
+			}
 		}
 	}
-	return candidates, nil
+	return out
 }
 
 // ─── URL Processor ─────────────────────────────────────────────────────────────

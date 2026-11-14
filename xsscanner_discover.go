@@ -216,9 +216,17 @@ func discoverTarget(target string, useKatana bool, force bool) {
 	if useKatana {
 		// Per the earlier Bug 3 fix: katana now crawls from ONLY the original
 		// input target URL (once), not from the passive-discovery output.
+		//
+		// BUG FIX (SPA no longer skips katana — mirrors main.go's fix): an SPA
+		// classification used to skip the katana crawl entirely, dropping
+		// katana's -automatic-form-fill discovery (the only mechanism that
+		// finds parameters living exclusively in HTML <form> inputs). SPA
+		// detection now only logs a notice; the crawl always runs unless
+		// disabled by flag or already completed and cached.
 		if spadetect.IsSPA(target) {
-			logMsg(fmt.Sprintf("[SKIP-SPA] %s: SPA detected, skipping katana crawl", target), D_cyan)
-		} else if fileExists(katanaOutFile) && fileExists(katanaOutFile+".done") && !force {
+			logMsg(fmt.Sprintf("[SPA-NOTICE] %s: SPA detected — katana crawl continues anyway (form-fill parameter discovery is valuable on SPAs too)", target), D_cyan)
+		}
+		if fileExists(katanaOutFile) && fileExists(katanaOutFile+".done") && !force {
 			logMsg(fmt.Sprintf("[CACHE-SKIP katana] %s — nice_katana already completed for this target, reusing %s", target, filepath.Base(katanaOutFile)), D_green)
 		} else {
 			logMsg(fmt.Sprintf("[2/2] Running nice_katana on input target for %s", target), D_gray)
