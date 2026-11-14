@@ -64,6 +64,30 @@ func main() {
 	var katanaDelay int
 	flag.IntVar(&katanaDelay, "delay", 0, "Inter-request delay in SECONDS forwarded to katana (katana's own default is 0; the existing -rl 12 rate-limit already throttles throughput)")
 
+	// Tunable global batch timeout. The hardcoded default is kept for CLI
+	// compatibility: 15 minutes per target, capped at 3 hours — but a heavy
+	// single target can now be given a shorter or longer budget from the
+	// command line (e.g. `-batch-timeout 10m` on a slow app so the run fails
+	// fast and the next run retries, or `-batch-timeout 45m` when full crawl
+	// coverage matters more than wall-clock time) without touching the code.
+	// A non-positive or unparsable value falls back to the default formula.
+	var batchTimeoutStr string
+	flag.StringVar(&batchTimeoutStr, "batch-timeout", "", "Global katana batch timeout as a Go duration (e.g. 10m, 90m, 2h). Overrides the default formula of 15 minutes per target capped at 3 hours. Non-positive or unparsable values fall back to the default formula")
+
+	// Light mode: speed over crawl coverage. The default invocation enables
+	// THREE JavaScript-processing features at once (`-js-crawl`, `-jsluice`,
+	// `-automatic-form-fill`), and on JS-heavy targets (e.g. webapp.nozbe.com)
+	// that combination is the main reason a crawl outruns even a 15-minute
+	// budget: every discovered .js file is fetched, parsed, and endpoint-
+	// extracted, and every HTML form is analyzed and auto-filled. Light mode
+	// disables all three so katana only walks plain HTML links — coverage is
+	// reduced (params living only in JS files or <form> inputs are missed),
+	// but a full crawl of a heavy target completes in a fraction of the time.
+	// Use it when a fast first pass matters more than completeness; the
+	// default (full) mode remains unchanged.
+	var lightMode bool
+	flag.BoolVar(&lightMode, "light-mode", false, "Speed-over-coverage crawl: disable -js-crawl, -jsluice and -automatic-form-fill (JS file parsing + form auto-fill are the dominant crawl-time cost on JS-heavy targets). Coverage is reduced; use when wall-clock time matters more than finding every JS/form-only parameter")
+
 	flag.Parse()
 
 	var targets []string
@@ -113,12 +137,46 @@ func main() {
 	gray := "\033[1;30m"
 	reset := "\033[0m"
 
-	fmt.Printf("%s[STARTUP] nice_katana processing batch size: %d URLs%s\n", gray, len(targets), reset)
+	// Resolve -batch-timeout: parse AFTER flag.Parse() so the value is the
+	// user's actual input. Unparsable/empty/non-positive → 0 → the default
+	// formula inside runNiceKatanaBatch applies (backward compatible).
+	batchTimeout := time.Duration(0)
+	if batchTimeoutStr != "" {
+		if d, derr := time.ParseDuration(batchTimeoutStr); derr != nil {
+			fmt.Printf("%s[WARNING] -batch-timeout %q is not a valid duration (%v) — using the default formula (15m per target, capped at 3h)%s\n", "\033[1;33m", batchTimeoutStr, derr, "\033[0m")
+		} else if d <= 0 {
+			fmt.Printf("%s[WARNING] -batch-timeout %q is non-positive — using the default formula (15m per target, capped at 3h)%s\n", "\033[1;33m", batchTimeoutStr, "\033[0m")
+		} else {
+			batchTimeout = d
+		}
+	}
 
-	runNiceKatanaBatch(targets, outDir, verbose, authCookie, authHeaders, katanaTimeout, katanaDelay)
+	fmt.Printf("%s[STARTUP] nice_katana processing batch size: %d URLs (light-mode=%v, batch-timeout=%s)%s\n", gray, len(targets), lightMode, describeBatchTimeout(batchTimeout, len(targets)), reset)
+
+	runNiceKatanaBatch(targets, outDir, verbose, authCookie, authHeaders, katanaTimeout, katanaDelay, batchTimeout, lightMode)
 }
 
-func runNiceKatanaBatch(targets []string, outDir string, verbose bool, authCookie string, authHeaders []string, katanaTimeout int, katanaDelay int) {
+// defaultBatchTimeout returns the historical default global batch budget:
+// 15 minutes per target, capped at 3 hours. Kept as a named helper so the
+// same formula is shared by runNiceKatanaBatch and its log/describe paths.
+func defaultBatchTimeout(nTargets int) time.Duration {
+	d := time.Duration(15*nTargets) * time.Minute
+	if d > 3*time.Hour {
+		d = 3 * time.Hour
+	}
+	return d
+}
+
+// describeBatchTimeout renders the effective timeout for log lines: an
+// explicit override verbatim, otherwise "<default formula> (default)".
+func describeBatchTimeout(override time.Duration, nTargets int) string {
+	if override > 0 {
+		return override.String() + " (override)"
+	}
+	return defaultBatchTimeout(nTargets).String() + " (default: 15m/target, cap 3h)"
+}
+
+func runNiceKatanaBatch(targets []string, outDir string, verbose bool, authCookie string, authHeaders []string, katanaTimeout int, katanaDelay int, batchTimeout time.Duration, lightMode bool) {
 	if len(targets) == 0 {
 		return
 	}
@@ -163,9 +221,7 @@ func runNiceKatanaBatch(targets []string, outDir string, verbose bool, authCooki
 	ctxArgs := []string{
 		"-list", tmpFile.Name(),
 		"-d", "2",
-		"-js-crawl",
 		"-known-files", "all",
-		"-automatic-form-fill",
 		"-extension-filter", extFilter,
 		"-c", "4",
 		"-rl", "12",
@@ -177,13 +233,35 @@ func runNiceKatanaBatch(targets []string, outDir string, verbose bool, authCooki
 		"-o", katanaOutput,
 	}
 
+	// Light mode (-light-mode): drop the three JavaScript-processing /
+	// form-analysis features from the invocation. On JS-heavy targets the
+	// combination of -js-crawl (fetch+parse every discovered .js), -jsluice
+	// (endpoint extraction from those files) and -automatic-form-fill
+	// (analyze+auto-fill every HTML form) is the dominant crawl-time cost —
+	// the webapp.nozbe.com run hit the 15-minute batch timeout with exactly
+	// this profile (jsluice=true in the timeout log line). In light mode
+	// katana walks plain HTML links only: fewer endpoints found (params that
+	// live only inside JS files or <form> inputs are missed), but a heavy
+	// target completes in a fraction of the time. Default (full) mode keeps
+	// the historical behavior — the flags below are appended exactly as
+	// before.
+	if !lightMode {
+		ctxArgs = append(ctxArgs, "-js-crawl", "-automatic-form-fill")
+	} else {
+		fmt.Printf("%s[LIGHT-MODE] -js-crawl, -jsluice and -automatic-form-fill disabled (speed over coverage; JS-only and form-only params will be missed this run)%s\n", yellow, reset)
+	}
+
 	// بررسی و افزودن امن فلگ jsluice (cache the result so it can also be
 	// reported in the verbose completion summary without re-running katana -h).
-	jsluiceApplied := supportsJsluice()
-	if jsluiceApplied {
-		ctxArgs = append(ctxArgs, "-jsluice")
-	} else {
-		fmt.Printf("%s[WARNING] Installed katana binary does not support -jsluice flag. Skipping it.%s\n", yellow, reset)
+	// Skipped entirely in light mode (jsluice is one of the disabled features).
+	jsluiceApplied := false
+	if !lightMode {
+		jsluiceApplied = supportsJsluice()
+		if jsluiceApplied {
+			ctxArgs = append(ctxArgs, "-jsluice")
+		} else {
+			fmt.Printf("%s[WARNING] Installed katana binary does not support -jsluice flag. Skipping it.%s\n", yellow, reset)
+		}
 	}
 
 	// Global auth headers (-cookie/-header from xsscanner): appended as extra
@@ -216,10 +294,12 @@ func runNiceKatanaBatch(targets []string, outDir string, verbose bool, authCooki
 		fmt.Printf("%s[VERBOSE] Command: katana %s%s\n", gray, strings.Join(ctxArgs, " "), reset)
 	}
 
-	timeoutDuration := time.Duration(15*len(targets)) * time.Minute
-	if timeoutDuration > 3*time.Hour {
-		timeoutDuration = 3 * time.Hour
+	// Global batch timeout: explicit -batch-timeout override if set (>0),
+	// otherwise the historical formula (15m per target, capped at 3h).
+	if batchTimeout <= 0 {
+		batchTimeout = defaultBatchTimeout(len(targets))
 	}
+	timeoutDuration := batchTimeout
 
 	start := time.Now()
 	// FIX (synchronous kill + racy timeout log): قبلاً cmd.Run() داخل
@@ -249,7 +329,7 @@ func runNiceKatanaBatch(targets []string, outDir string, verbose bool, authCooki
 		if verbose && stdoutBuf.Len() > 0 {
 			fmt.Printf("%s[VERBOSE] Katana Stdout (pre-timeout):%s\n%s\n", gray, reset, stdoutBuf.String())
 		}
-		fmt.Printf("%skatana timed out for batch after %v, killing process (jsluice=%v, duration=%s)%s\n", gray, timeoutDuration, jsluiceApplied, duration.Round(time.Second), reset)
+		fmt.Printf("%skatana timed out for batch after %v, killing process (jsluice=%v, light-mode=%v, duration=%s)%s\n", gray, timeoutDuration, jsluiceApplied, lightMode, duration.Round(time.Second), reset)
 		return
 	}
 

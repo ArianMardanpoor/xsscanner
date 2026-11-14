@@ -1047,10 +1047,43 @@ var (
         curlCheckerExists    bool
         skipSPA              bool
 
-        consecutiveDead int64
-        phase           int
+	consecutiveDead int64
+	phase           int
 
-        reX9       = regexp.MustCompile(`(?:<b9|['"])?x9(?:canary)?[a-z]*(?:['"\;<{]|\{\{)?`)
+	// ── Probe-once-per-path support (probe-reuse optimization) ─────────────
+	//
+	// probeCacheDir (-probe-cache <dir>): when set, a fresh probeURL() run
+	// persists its artifacts (writeProbeArtifacts) into this dir so the
+	// LATER chunks of the same path (separate xssniper invocations
+	// orchestrated by xsscanner's -probe-only-once) can load them via
+	// loadProbeArtifacts instead of re-running the whole phase-1..3 probe.
+	//
+	// reuseProbeDir (-reuse-probe <dir>): when set, this invocation SKIPS the
+	// fresh probe entirely and loads this path's artifacts from the given
+	// dir (falling back to a fresh probe when the summary is missing or
+	// corrupt — reuse is an optimization, never a correctness dependency).
+	//
+	// probeParamsFile (-probe-params <file>): the param list the PROBE's x9
+	// run uses instead of -p. xsscanner passes the target-wide FULL param
+	// list here on a path's probing invocation so the single shared probe
+	// covers every chunk's params (x9 unions the file into its probe URL
+	// set). Without this, later chunks' params would never receive a canary
+	// — the probe would only cover chunk 1. -p stays the per-invocation
+	// CHUNK and still drives the confirm scoping and the attack stage.
+	//
+	// Together these implement the split: xsscanner's first chunk call passes
+	// -probe-cache (+ -probe-params <full list>), later chunk calls pass
+	// -reuse-probe (same dir). The probing invocation confirms ALL phase-3
+	// findings (legacy behavior — see confirmAndAttack: the reflecting params
+	// may include x9's built-in defaults that live in NO chunk, so strict
+	// chunk-scoping there would silently downgrade real findings); the reuse
+	// invocations confirm only their own chunk's params and run their chunk's
+	// attack stage.
+	probeCacheDir   string
+	reuseProbeDir   string
+	probeParamsFile string
+
+	reX9       = regexp.MustCompile(`(?:<b9|['"])?x9(?:canary)?[a-z]*(?:['"\;<{]|\{\{)?`)
         rePayload  = regexp.MustCompile(`\[(?:"([^"]+)"|([^"\]]+))\]$`)
         reANSI     = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
         reCleaning = regexp.MustCompile(`\s*\["0m"\]\s*`)
@@ -1858,23 +1891,216 @@ func aggregateLocationFindings(report *VulnerabilityReport, openRedirects []stri
 }
 
 type ProbeArtifacts struct {
-        TargetURL         string
-        Index             int
-        Total             int
-        Profile           TechProfile
-        HasJS             bool
-        TargetAlive       bool
-        ProbeOutputBase   string
-        DomQueryProbeFile string
-        TriageOnly        bool
-        GetParamSet       map[string]bool
-        GetReflectedRaw   []string
-        CandidateHeaders  []string
-        Skip              bool
-        WAFBlocked        bool // NEW FIELD
+	TargetURL         string
+	Index             int
+	Total             int
+	Profile           TechProfile
+	HasJS             bool
+	TargetAlive       bool
+	ProbeOutputBase   string
+	DomQueryProbeFile string
+	TriageOnly        bool
+	GetParamSet       map[string]bool
+	GetReflectedRaw   []string
+	CandidateHeaders  []string
+	Skip              bool
+	WAFBlocked        bool // NEW FIELD
+
+	// ── Probe-reuse support (probe-once-per-path optimization) ──────────────
+	//
+	// P3Findings carries the RAW phase-3 results (reflected URLs per probe
+	// phase, keys "get"/"json") so confirmAndAttack can run them through the
+	// confirm loop without re-running the probe. processURLFast populated
+	// GetParamSet/GetReflectedRaw/CandidateHeaders from the same map; keeping
+	// the map itself on the struct lets the split function share it directly.
+	P3Findings map[string][]string
 }
 
-func processURLFast(targetURL string, index, total int) ProbeArtifacts {
+// probeURL runs Phases 1-3 for one target URL: x9 probe-file generation,
+// aliveness/JS/WAF checks, CORS, the curl_reflect_checker GET/JSON sweep and
+// the header-reflection sweep, plus the location/open-redirect check. It is
+// the chunk-INDEPENDENT part of the old processURLFast — none of it depends
+// on the -p param file's contents (x9 unions the file params into its probe
+// URL set, so the probe output is a superset for any later chunk), which is
+// exactly why it can run ONCE per path while the per-chunk confirmAndAttack
+// runs per chunk.
+//
+// populateFromProbeFiles (the .get/.json/.header stat+parse loop) is the only
+// network-touching part guarded by phase flags: phase < 3 returns early after
+// the x9 probe generation (identical to the old processURLFast behavior).
+func probeURL(targetURL string, index, total int) ProbeArtifacts {
+	return populateFromProbeFiles(targetURL, index, total, true)
+}
+
+// loadProbeArtifacts rebuilds ProbeArtifacts from probe files a previous
+// xssniper run already wrote to disk (probe-cache mode), WITHOUT re-running
+// the x9 probe generation or the curl_reflect_checker sweep. Used with
+// -reuse-probe <dir>: the first chunk of a path probes fresh
+// (probeURL, which persists its artifacts), later chunks load them via this
+// function and go straight to confirmAndAttack.
+//
+// The report-relevant fields (GetParamSet / GetReflectedRaw /
+// CandidateHeaders / P3Findings) CANNOT be rebuilt from the raw .get/.json
+// probe files alone (they are the output of the curl_reflect_checker sweep,
+// not a simple file parse), so -reuse-probe expects the summary JSON written
+// by the probing run (writeProbeArtifacts). If it is missing or unreadable
+// the caller falls back to a fresh probeURL — reuse is an optimization, never
+// a correctness dependency.
+func loadProbeArtifacts(targetURL string, index, total int, cacheDir string) ProbeArtifacts {
+	art := ProbeArtifacts{TargetURL: targetURL, Index: index, Total: total}
+
+	summaryPath := filepath.Join(cacheDir, safeName(targetURL)+"-probe-summary.json")
+	data, err := os.ReadFile(summaryPath)
+	if err != nil {
+		logLine("PROBE-REUSE", X_yellow, "%s: no probe summary at %s (%v) — falling back to a fresh probe", targetURL, summaryPath, err)
+		return probeURL(targetURL, index, total)
+	}
+	var s probeSummaryJSON
+	if err := json.Unmarshal(data, &s); err != nil {
+		logLine("PROBE-REUSE", X_yellow, "%s: corrupt probe summary at %s (%v) — falling back to a fresh probe", targetURL, summaryPath, err)
+		return probeURL(targetURL, index, total)
+	}
+
+	uParsed, err := url.Parse(targetURL)
+	if err != nil || uParsed == nil {
+		logLine("SKIP", X_yellow, "unparseable URL, skipping: %s", targetURL)
+		art.Skip = true
+		return art
+	}
+	normalizedLockURL := targetURL
+	uParsed.Path = strings.TrimSuffix(uParsed.Path, "/")
+	if strings.HasSuffix(uParsed.Path, "/index.php") {
+		uParsed.Path = strings.TrimSuffix(uParsed.Path, "/index.php")
+	}
+	if strings.HasSuffix(uParsed.Path, "/index.html") {
+		uParsed.Path = strings.TrimSuffix(uParsed.Path, "/index.html")
+	}
+	normalizedLockURL = uParsed.String()
+
+	if _, loaded := workerLock.LoadOrStore(normalizedLockURL, true); loaded {
+		art.Skip = true
+		return art
+	}
+
+	atomic.AddInt64(&processedTargets, 1)
+	currProcessed := atomic.LoadInt64(&processedTargets)
+	currVulns := atomic.LoadInt64(&vulnerableTargets)
+	logLine("TARGET", X_white, "[%d/%d | Vulns: %d] %s (reusing cached probe)", currProcessed, total, currVulns, targetURL)
+
+	// Rebuild the tech profile exactly as a fresh probe would have (same
+	// SPA merge, same forceAll override) so downstream SKIP-TECH decisions
+	// in confirmAndAttack match the probing run's.
+	profile := classifyTechProfile(strings.Split(techFlag, ","))
+	if s.IsSPADetected && !forceAll {
+		profile.IsSPA = true
+		profile.Unknown = false
+	}
+	art.Profile = profile
+	art.TargetAlive = s.TargetAlive
+	art.HasJS = s.HasJS
+	art.WAFBlocked = s.WAFBlocked
+	art.ProbeOutputBase = s.ProbeOutputBase
+	art.DomQueryProbeFile = s.DomQueryProbeFile
+	art.GetParamSet = make(map[string]bool, len(s.GetParams))
+	for _, p := range s.GetParams {
+		art.GetParamSet[p] = true
+	}
+	art.GetReflectedRaw = append([]string(nil), s.GetReflectedRaw...)
+	art.CandidateHeaders = append([]string(nil), s.CandidateHeaders...)
+	art.P3Findings = make(map[string][]string, len(s.P3Findings))
+	for k, v := range s.P3Findings {
+		art.P3Findings[k] = append([]string(nil), v...)
+	}
+
+	// Restored artifacts are phase-3-complete by construction: a probing run
+	// only writes the summary after the full curl_reflect_checker sweep.
+	// (TriageOnly/phase handling happens in the caller, exactly as before.)
+	logLine("PROBE-REUSE", X_cyan, "%s: loaded cached probe artifacts from %s (%d reflected URL(s) across %d phase(s), %d candidate header(s))",
+		targetURL, summaryPath, len(art.GetReflectedRaw), len(art.P3Findings), len(art.CandidateHeaders))
+	return art
+}
+
+// probeSummaryJSON is the on-disk shape of the probe-reuse summary (written
+// by writeProbeArtifacts, read by loadProbeArtifacts). Field names are part
+// of the probe-cache contract between consecutive xssniper invocations of
+// the same path — change them only together.
+type probeSummaryJSON struct {
+	IsSPADetected     bool              `json:"isSpaDetected"`
+	TargetAlive       bool              `json:"targetAlive"`
+	HasJS             bool              `json:"hasJS"`
+	WAFBlocked        bool              `json:"wafBlocked"`
+	ProbeOutputBase   string            `json:"probeOutputBase"`
+	DomQueryProbeFile string            `json:"domQueryProbeFile"`
+	GetParams         []string          `json:"getParams"`
+	GetReflectedRaw   []string          `json:"getReflectedRaw"`
+	CandidateHeaders  []string          `json:"candidateHeaders"`
+	P3Findings        map[string][]string `json:"p3Findings"`
+}
+
+// writeProbeArtifacts persists the probe-reuse summary for targetURL into
+// cacheDir. Best-effort: a write failure is logged and never aborts the run
+// (the next chunk then falls back to a fresh probe — slower, still correct).
+// Called by the xssniper main loop when probeCacheDir is set, right after a
+// fresh probeURL() completed for a path.
+func writeProbeArtifacts(art ProbeArtifacts, cacheDir string) {
+	if art.Skip {
+		return
+	}
+	s := probeSummaryJSON{
+		IsSPADetected:     art.Profile.IsSPA,
+		TargetAlive:       art.TargetAlive,
+		HasJS:             art.HasJS,
+		WAFBlocked:        art.WAFBlocked,
+		ProbeOutputBase:   art.ProbeOutputBase,
+		DomQueryProbeFile: art.DomQueryProbeFile,
+		GetParams:         sortedKeysOf(art.GetParamSet),
+		GetReflectedRaw:   append([]string(nil), art.GetReflectedRaw...),
+		CandidateHeaders:  append([]string(nil), art.CandidateHeaders...),
+		P3Findings:        art.P3Findings,
+	}
+	if s.P3Findings == nil {
+		s.P3Findings = map[string][]string{}
+	}
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		logLine("PROBE-REUSE", X_yellow, "%s: failed to marshal probe summary: %v", art.TargetURL, err)
+		return
+	}
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		logLine("PROBE-REUSE", X_yellow, "%s: failed to create probe cache dir %s: %v", art.TargetURL, cacheDir, err)
+		return
+	}
+	summaryPath := filepath.Join(cacheDir, safeName(art.TargetURL)+"-probe-summary.json")
+	if err := os.WriteFile(summaryPath, append(data, '\n'), 0644); err != nil {
+		logLine("PROBE-REUSE", X_yellow, "%s: failed to write probe summary %s: %v", art.TargetURL, summaryPath, err)
+		return
+	}
+	logLine("PROBE-REUSE", X_green, "%s: probe artifacts saved to %s (later chunks of this path will reuse them)", art.TargetURL, summaryPath)
+}
+
+// sortedKeysOf returns the sorted keys of a map[string]bool (same output as
+// main.go's sortedKeys helper, local copy so xssniper stays self-contained).
+func sortedKeysOf(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// populateFromProbeFiles is the former processURLFast, renamed and split as
+// part of the probe-once-per-path optimization: it runs ONLY Phases 1-3
+// (x9 probe-file generation, aliveness/JS/WAF checks, CORS, the
+// curl_reflect_checker GET/JSON/header sweep + location check). The Phase-4
+// confirm+attack tail was extracted into confirmAndAttack so it can run once
+// per param chunk while this probe part runs once per path.
+//
+// writeSummary controls whether the run's artifacts are persisted as a
+// probe-reuse summary (see writeProbeArtifacts): set by the main loop for
+// the probing run (first chunk of a path under -probe-cache), left off for
+// plain single-shot invocations where no later run would consume it.
+func populateFromProbeFiles(targetURL string, index, total int, writeSummary bool) ProbeArtifacts {
         art := ProbeArtifacts{TargetURL: targetURL, Index: index, Total: total}
 
         uParsed, err := url.Parse(targetURL)
@@ -1949,18 +2175,36 @@ func processURLFast(targetURL string, index, total int) ProbeArtifacts {
         probeOutputBase := filepath.Join(outputDir, safeName(targetURL)+"-probe-out")
         art.ProbeOutputBase = probeOutputBase
 
-        // 1. Initial Probe Invocation (CORRECTED)
-        xArgs := []string{"-i", probeInput, "-probe", "-json", "-headers", "-dom", "-o", probeOutputBase}
-        if paramFile != "" {
-                xArgs = append(xArgs, "-p", paramFile)
-        }
-        runCommand("./x9", xArgs...)
+	// 1. Initial Probe Invocation (CORRECTED)
+	//
+	// Probe-reuse: with -probe-params, the probe's x9 run uses THAT file
+	// instead of -p. xsscanner passes the target-wide FULL param list here
+	// so the single shared probe generates canary URLs for every chunk's
+	// params at once (x9 unions the file's params into its probe set). -p
+	// remains the per-invocation CHUNK and is still what the confirm loop
+	// and attack stage use.
+	probeX9Params := paramFile
+	if probeParamsFile != "" {
+		probeX9Params = probeParamsFile
+	}
+	xArgs := []string{"-i", probeInput, "-probe", "-json", "-headers", "-dom", "-o", probeOutputBase}
+	if probeX9Params != "" {
+		xArgs = append(xArgs, "-p", probeX9Params)
+	}
+	runCommand("./x9", xArgs...)
 
-        domQueryProbeFile := filepath.Join(outputDir, safeName(targetURL)+"-dom-query-probe.txt")
-        art.DomQueryProbeFile = domQueryProbeFile
-        paramsToProbe := []string{}
-        if paramFile != "" {
-                if pf, err := os.Open(paramFile); err == nil {
+	domQueryProbeFile := filepath.Join(outputDir, safeName(targetURL)+"-dom-query-probe.txt")
+	art.DomQueryProbeFile = domQueryProbeFile
+	// Probe-reuse: the DOM-query canary sweep also covers the full param
+	// list when -probe-params is set (same rationale as the x9 probe above —
+	// one shared probe must canary every chunk's params).
+	domProbeParamsSrc := paramFile
+	if probeParamsFile != "" {
+		domProbeParamsSrc = probeParamsFile
+	}
+	paramsToProbe := []string{}
+	if domProbeParamsSrc != "" {
+		if pf, err := os.Open(domProbeParamsSrc); err == nil {
                         scanner := bufio.NewScanner(pf)
                         for scanner.Scan() {
                                 if p := strings.TrimSpace(scanner.Text()); p != "" {
@@ -2142,107 +2386,198 @@ func processURLFast(targetURL string, index, total int) ProbeArtifacts {
                 }
         }
 
-        getParamSet := make(map[string]bool)
-        for _, u := range p3Findings["get"] {
-                parsed, err := url.Parse(u)
-                if err == nil {
-                        for k := range parsed.Query() {
-                                getParamSet[k] = true
-                        }
-                }
-        }
-        var getParams []string
-        for k := range getParamSet {
-                getParams = append(getParams, k)
-        }
-        sort.Strings(getParams)
+	getParamSet := make(map[string]bool)
+	for _, u := range p3Findings["get"] {
+		parsed, err := url.Parse(u)
+		if err == nil {
+			for k := range parsed.Query() {
+				getParamSet[k] = true
+			}
+		}
+	}
+	var getParams []string
+	for k := range getParamSet {
+		getParams = append(getParams, k)
+	}
+	sort.Strings(getParams)
 
-        headers := candidateHeaders
-        sort.Strings(headers)
+	headers := candidateHeaders
+	sort.Strings(headers)
 
-        art.GetParamSet = getParamSet
-        art.GetReflectedRaw = append([]string(nil), p3Findings["get"]...)
-        art.CandidateHeaders = append([]string(nil), headers...)
+	art.GetParamSet = getParamSet
+	art.GetReflectedRaw = append([]string(nil), p3Findings["get"]...)
+	art.CandidateHeaders = append([]string(nil), headers...)
+	art.P3Findings = p3Findings
 
-        if len(getParamSet) > 0 || len(headers) > 0 {
-                paramsStr := strings.Join(getParams, ", ")
-                if paramsStr == "" {
-                        paramsStr = "none"
-                }
-                headersStr := strings.Join(headers, ", ")
-                if headersStr == "" {
-                        headersStr = "none"
-                }
-                logLine("HIT-HTTP", X_green, "%s → params: %s | headers: %s", targetURL, paramsStr, headersStr)
-        } else {
-                logLine("CLEAN-HTTP", X_gray, "%s", targetURL)
-        }
+	// Probe-reuse: persist the artifacts of this fresh probe so later chunks
+	// of the same path (separate xssniper invocations under -probe-cache)
+	// can load them via loadProbeArtifacts instead of re-probing. The report
+	// var built above (CORS + location findings from THIS probe) is finalized
+	// by THIS run's confirmAndAttack, not by the reuse path, so it is NOT
+	// serialized — each xssniper invocation still emits its own findings.
+	if writeSummary && probeCacheDir != "" {
+		writeProbeArtifacts(art, probeCacheDir)
+	}
 
-        if phase == 3 {
-                art.TriageOnly = true
-                return art
-        }
+	if len(getParamSet) > 0 || len(headers) > 0 {
+		paramsStr := strings.Join(getParams, ", ")
+		if paramsStr == "" {
+			paramsStr = "none"
+		}
+		headersStr := strings.Join(headers, ", ")
+		if headersStr == "" {
+			headersStr = "none"
+		}
+		logLine("HIT-HTTP", X_green, "%s → params: %s | headers: %s", targetURL, paramsStr, headersStr)
+	} else {
+		logLine("CLEAN-HTTP", X_gray, "%s", targetURL)
+	}
 
-        if len(p3Findings) == 0 && len(candidateHeaders) == 0 {
-                return art
-        }
+	if phase == 3 {
+		art.TriageOnly = true
+		return art
+	}
 
-        if art.WAFBlocked {
-                logLine("WAF-BLOCKED", X_yellow, "%s: WAF challenge detected — recording %d candidate params/headers but skipping confirm+attack (manual review recommended)", targetURL, len(getParamSet)+len(candidateHeaders))
-        } else if shouldAbortForBlock() {
-                // WAF/block guard crossed the threshold during Phase 3
-                // (curl_reflect_checker calls were each classified inside
-                // curlRequestAttempt's recordResponse hook). Treat exactly
-                // like WAFBlocked: skip confirm+attack but keep the
-                // pre-block findings.
-                art.WAFBlocked = true
-                logLine("BLOCK-ABORT", X_yellow, "%s: block threshold (%d) reached before Phase 4 confirm+attack — recording %d candidate params/headers and skipping the heavy phase", targetURL, blockThreshold, len(getParamSet)+len(candidateHeaders))
-        } else {
-                targetAlive, wafDetected = isTargetAlive(targetURL)
-                if !targetAlive || wafDetected {
-                        if !targetAlive {
-                                logLine("DEAD-MIDSCAN", X_yellow, "%s went dead before Phase 4b, skipping confirm+attack", targetURL)
-                        } else {
-                                logLine("WAF-CHALLENGE-MIDSCAN", X_yellow, "%s: WAF challenge re-confirmed before heavy phase, skipping remaining attack steps", targetURL)
-                        }
-                        art.TargetAlive = targetAlive
-                        if report.HasVulns() {
-                                tg.notify(report)
-                        }
-                        logReportFindings(&report)
-                        return art
-                }
-                if shouldAbortForBlock() {
-                        art.WAFBlocked = true
-                        logLine("BLOCK-ABORT", X_yellow, "%s: block threshold (%d) reached mid-recheck — skipping Phase 4 confirm+attack", targetURL, blockThreshold)
-                }
-        }
+	return art
+}
 
-        confirmedParams := make(map[string]map[string]bool)
-        for p := range p3Findings {
-                confirmedParams[p] = make(map[string]bool)
-        }
+// confirmAndAttack runs the chunk-DEPENDENT half of the old processURLFast
+// (Phase 4) against already-probed artifacts: the confirmParameter loop for
+// the phase-3 findings' param names, the header confirm loop, the re-alive
+// checks and the x9 attack + curl_reflect_checker attack verification.
+//
+// It is called once per (path, chunk) by the main loop. The per-chunk input
+// is the -p param file (the chunk): when restrictToParamFile is set
+// (-reuse-probe mode), the confirm loop is restricted to the param names the
+// chunk file carries — this invocation's share of the per-path work; other
+// chunks' params are confirmed by their own invocations. The PROBING
+// invocation (probe-cache mode, no -reuse-probe) passes
+// restrictToParamFile=false: it confirms ALL phase-3 findings exactly like
+// the legacy pipeline. That asymmetry is deliberate: phase-3 findings
+// routinely include params that live in NO chunk (x9's built-in default
+// list, params from the path's own query string, params discovered before
+// the aggregate was chunked) — if the probing run chunk-scoped its confirm,
+// those findings would be recorded as unconfirmed "likely" candidates and
+// never re-examined (verified empirically on the echo-server test: an
+// earlier strict-scoping draft downgraded id/name/next/q from confirmed to
+// likely). The probing invocation therefore matches legacy behavior, and
+// only the reuse invocations (which exist purely to cover their chunk) are
+// chunk-scoped. The union of all invocations' confirms is a superset of the
+// legacy single-run confirm.
+//
+// All WAF/block-guard semantics are preserved verbatim: art.WAFBlocked and
+// shouldAbortForBlock() gate the confirm loop exactly as before, and any
+// request made here still flows through recordResponse → blockCounter →
+// -block-status-out for main.go to carry forward.
+func confirmAndAttack(art ProbeArtifacts, restrictToParamFile bool) {
+	if art.Skip || phase < 4 {
+		return
+	}
+	targetURL := art.TargetURL
+	profile := art.Profile
+	p3Findings := art.P3Findings
+	candidateHeaders := art.CandidateHeaders
 
-        for probePhase, urls := range p3Findings {
-                dummy := ""
-                for _, u := range urls {
-                        dummy += "[canary] [info] " + u + " [x9canary]\n"
-                }
-                report.aggregateFindings(dummy, probePhase)
+	if p3Findings == nil {
+		p3Findings = make(map[string][]string)
+	}
+	if len(p3Findings) == 0 && len(candidateHeaders) == 0 {
+		return
+	}
 
-                if !art.WAFBlocked {
-                        var vList *[]Vulnerability
-                        switch probePhase {
-                        case "get":
-                                vList = &report.QueryParameters
-                        case "json":
-                                vList = &report.JSONBody
-                        }
+	report := VulnerabilityReport{URL: targetURL}
 
-                        if vList != nil {
-                                for i := range *vList {
-                                        name := (*vList)[i].Name
-                                        if ok, p, hasCSP, allowsInline, reflType := confirmParameter(targetURL, probePhase, name); ok {
+	if art.WAFBlocked {
+		logLine("WAF-BLOCKED", X_yellow, "%s: WAF challenge detected — recording %d candidate params/headers but skipping confirm+attack (manual review recommended)", targetURL, len(art.GetParamSet)+len(candidateHeaders))
+	} else if shouldAbortForBlock() {
+		// WAF/block guard crossed the threshold during Phase 3
+		// (curl_reflect_checker calls were each classified inside
+		// curlRequestAttempt's recordResponse hook). Treat exactly
+		// like WAFBlocked: skip confirm+attack but keep the
+		// pre-block findings.
+		art.WAFBlocked = true
+		logLine("BLOCK-ABORT", X_yellow, "%s: block threshold (%d) reached before Phase 4 confirm+attack — recording %d candidate params/headers and skipping the heavy phase", targetURL, blockThreshold, len(art.GetParamSet)+len(candidateHeaders))
+	} else {
+		targetAlive, wafDetected := isTargetAlive(targetURL)
+		if !targetAlive || wafDetected {
+			if !targetAlive {
+				logLine("DEAD-MIDSCAN", X_yellow, "%s went dead before Phase 4b, skipping confirm+attack", targetURL)
+			} else {
+				logLine("WAF-CHALLENGE-MIDSCAN", X_yellow, "%s: WAF challenge re-confirmed before heavy phase, skipping remaining attack steps", targetURL)
+			}
+			art.TargetAlive = targetAlive
+			if report.HasVulns() {
+				tg.notify(report)
+			}
+			logReportFindings(&report)
+			return
+		}
+		if shouldAbortForBlock() {
+			art.WAFBlocked = true
+			logLine("BLOCK-ABORT", X_yellow, "%s: block threshold (%d) reached mid-recheck — skipping Phase 4 confirm+attack", targetURL, blockThreshold)
+		}
+	}
+
+	// chunkParamSet (-reuse-probe mode): when the caller restricts the confirm
+	// loop to the -p param file's contents, load it once here. Only the param
+	// names present in BOTH the phase-3 findings and the chunk file get
+	// confirmed this run — the chunk defines this invocation's share of the
+	// per-path work; other chunks' params are confirmed by their own runs
+	// (plus everything by the probing run, see the function doc).
+	var chunkParamSet map[string]bool
+	if restrictToParamFile && paramFile != "" {
+		chunkParamSet = make(map[string]bool)
+		if pf, err := os.Open(paramFile); err == nil {
+			scanner := bufio.NewScanner(pf)
+			for scanner.Scan() {
+				if p := strings.TrimSpace(scanner.Text()); p != "" {
+					chunkParamSet[p] = true
+				}
+			}
+			pf.Close()
+		}
+	}
+	// chunkAllows reports whether name belongs to this invocation's chunk
+	// (always true when not restricted).
+	chunkAllows := func(name string) bool {
+		if chunkParamSet == nil {
+			return true
+		}
+		return chunkParamSet[name]
+	}
+
+	confirmedParams := make(map[string]map[string]bool)
+	for p := range p3Findings {
+		confirmedParams[p] = make(map[string]bool)
+	}
+
+	for probePhase, urls := range p3Findings {
+		dummy := ""
+		for _, u := range urls {
+			dummy += "[canary] [info] " + u + " [x9canary]\n"
+		}
+		report.aggregateFindings(dummy, probePhase)
+
+		if !art.WAFBlocked {
+			var vList *[]Vulnerability
+			switch probePhase {
+			case "get":
+				vList = &report.QueryParameters
+			case "json":
+				vList = &report.JSONBody
+			}
+
+				if vList != nil {
+					for i := range *vList {
+						name := (*vList)[i].Name
+						if !chunkAllows(name) {
+							// -reuse-probe mode: this param belongs to another
+							// chunk's invocation — leave the candidate entry as
+							// recorded, skip confirming it here. (The probing
+							// invocation confirmed everything already.)
+							continue
+						}
+					if ok, p, hasCSP, allowsInline, reflType := confirmParameter(targetURL, probePhase, name); ok {
                                                 if reflType == "breakout_confirmed_quote" || reflType == "breakout_confirmed_tag" {
                                                         (*vList)[i].Confirmed = true
                                                         if hasCSP && !allowsInline {
@@ -2267,15 +2602,25 @@ func processURLFast(targetURL string, index, total int) ProbeArtifacts {
                 }
         }
 
-        for _, headerName := range candidateHeaders {
-                if art.WAFBlocked {
-                        report.Headers = append(report.Headers, Vulnerability{
-                                Name:      headerName,
-                                Severity:  "possible",
-                                Confirmed: false,
-                        })
-                        continue
-                }
+	for _, headerName := range candidateHeaders {
+		if art.WAFBlocked {
+			report.Headers = append(report.Headers, Vulnerability{
+				Name:      headerName,
+				Severity:  "possible",
+				Confirmed: false,
+			})
+			continue
+		}
+		// -reuse-probe mode: header reflection confirmation is NOT chunk-scoped
+		// (the header set comes from the shared probe, not from the -p param
+		// file) — every reuse invocation would repeat identical
+		// confirmParameter calls. The PROBING invocation (restrictToParamFile
+		// == false) confirms every candidate header, exactly like the legacy
+		// pipeline; reuse invocations skip the header confirm entirely (the
+		// findings were already logged/persisted by the probing run).
+		if restrictToParamFile {
+			continue
+		}
 
                 if ok, payloads, hasCSP, allowsInline, reflType := confirmParameter(targetURL, "header", headerName); ok {
                         severity := "likely"
@@ -2312,64 +2657,64 @@ func processURLFast(targetURL string, index, total int) ProbeArtifacts {
                         tg.notify(report)
                 }
                 logReportFindings(&report)
-                return art
+                return
         }
 
-        targetAlive, wafDetected = isTargetAlive(targetURL)
-        if !targetAlive || wafDetected {
-                if !targetAlive {
-                        logLine("DEAD-MIDSCAN", X_yellow, "%s went dead before Phase 4, skipping attack", targetURL)
-                } else {
-                        logLine("WAF-CHALLENGE-MIDSCAN", X_yellow, "%s: WAF challenge re-confirmed before heavy phase, skipping remaining attack steps", targetURL)
-                }
-                art.TargetAlive = targetAlive
-                if report.HasVulns() {
-                        tg.notify(report)
-                }
-                logReportFindings(&report)
-                return art
-        }
+	targetAlive, wafDetected := isTargetAlive(targetURL)
+	if !targetAlive || wafDetected {
+		if !targetAlive {
+			logLine("DEAD-MIDSCAN", X_yellow, "%s went dead before Phase 4, skipping attack", targetURL)
+		} else {
+			logLine("WAF-CHALLENGE-MIDSCAN", X_yellow, "%s: WAF challenge re-confirmed before heavy phase, skipping remaining attack steps", targetURL)
+		}
+		art.TargetAlive = targetAlive
+		if report.HasVulns() {
+			tg.notify(report)
+		}
+		logReportFindings(&report)
+		return
+	}
 
-        httpAtkUrls := []string{}
-        // WAF/block guard: skip the heavy Phase 4 attack stage entirely once the
-        // threshold has been crossed. Partial pre-block findings are kept.
-        if shouldAbortForBlock() {
-                logLine("BLOCK-ABORT", X_yellow, "%s: block threshold (%d) reached — skipping Phase 4 HTTP attack stage (partial findings preserved)", targetURL, blockThreshold)
-                if report.HasVulns() {
-                        tg.notify(report)
-                }
-                logReportFindings(&report)
-                return art
-        }
-        for probePhase, urls := range p3Findings {
-                for _, u := range urls {
-                        uParsedAtk, _ := url.Parse(u)
-                        if uParsedAtk == nil {
-                                continue
-                        }
-                        isConfirmed := false
+	httpAtkUrls := []string{}
+	// WAF/block guard: skip the heavy Phase 4 attack stage entirely once the
+	// threshold has been crossed. Partial pre-block findings are kept.
+	if shouldAbortForBlock() {
+		logLine("BLOCK-ABORT", X_yellow, "%s: block threshold (%d) reached — skipping Phase 4 HTTP attack stage (partial findings preserved)", targetURL, blockThreshold)
+		if report.HasVulns() {
+			tg.notify(report)
+		}
+		logReportFindings(&report)
+		return
+	}
+	for probePhase, urls := range p3Findings {
+		for _, u := range urls {
+			uParsedAtk, _ := url.Parse(u)
+			if uParsedAtk == nil {
+				continue
+			}
+			isConfirmed := false
 
-                        query := uParsedAtk.Query()
-                        for name := range confirmedParams[probePhase] {
-                                switch probePhase {
-                                case "get":
-                                        if _, exists := query[name]; exists {
-                                                isConfirmed = true
-                                        }
-                                case "json":
-                                        if strings.Contains(u, "\""+name+"\"") {
-                                                isConfirmed = true
-                                        }
-                                }
-                                if isConfirmed {
-                                        break
-                                }
-                        }
-                        if !isConfirmed && isInScope(targetURL, u) && isConcreteURL(u) {
-                                httpAtkUrls = append(httpAtkUrls, u)
-                        }
-                }
-        }
+			query := uParsedAtk.Query()
+			for name := range confirmedParams[probePhase] {
+				switch probePhase {
+				case "get":
+					if _, exists := query[name]; exists {
+						isConfirmed = true
+					}
+				case "json":
+					if strings.Contains(u, "\""+name+"\"") {
+						isConfirmed = true
+					}
+				}
+				if isConfirmed {
+					break
+				}
+			}
+			if !isConfirmed && isInScope(targetURL, u) && isConcreteURL(u) {
+				httpAtkUrls = append(httpAtkUrls, u)
+			}
+		}
+	}
 
         if len(httpAtkUrls) > 0 {
                 atkIn := filepath.Join(outputDir, safeName(targetURL)+"-http-atk-in.txt")
@@ -2483,12 +2828,12 @@ func processURLFast(targetURL string, index, total int) ProbeArtifacts {
                 }
         }
 
-        if report.HasVulns() {
-                tg.notify(report)
-        }
-        logReportFindings(&report)
+	if report.HasVulns() {
+		tg.notify(report)
+	}
+	logReportFindings(&report)
 
-        return art
+	return
 }
 
 func processURLDom(art ProbeArtifacts) VulnerabilityReport {
@@ -2951,8 +3296,22 @@ func main() {
         hcIntervalFlag := flag.Duration("hc-interval", 5*time.Minute, "Proxy health-check interval")
         hcTimeoutFlag := flag.Duration("hc-timeout", 5*time.Second, "Proxy health-check timeout")
         runCmdTimeoutFlag := flag.Duration("cmd-timeout", 5*time.Minute, "Hard timeout for external subprocess calls (dom_sink_checker, x9, curl_reflect_checker)")
+
+        // Probe-once-per-path flags (see the probeCacheDir/reuseProbeDir/
+        // probeParamsFile block above for the full contract). xsscanner's
+        // chunked test loop drives these: the first chunk invocation of a
+        // path passes -probe-cache + -probe-params <full param list> (fresh
+        // shared probe covering every chunk, full confirm), the later chunks
+        // pass -reuse-probe (same dir) and confirm only their own -p chunk.
+        probeCacheFlag := flag.String("probe-cache", "", "Persist this run's phase-1..3 probe artifacts (probe summary JSON) into this directory so later chunks of the same path can reuse them via -reuse-probe (probe-once-per-path optimization; the probe sweep costs ~25-30s per path and is chunk-independent)")
+        reuseProbeFlag := flag.String("reuse-probe", "", "Skip the fresh phase-1..3 probe and load this path's probe artifacts from this directory (written by a previous invocation's -probe-cache). Missing/corrupt summary falls back to a fresh probe. The confirm loop is restricted to the -p chunk file's params; the probing invocation (no -reuse-probe) confirms everything")
+        probeParamsFlag := flag.String("probe-params", "", "Parameter file for the PROBE's x9 run (overrides -p for probe URL generation only; -p still drives confirm scoping and the attack stage). xsscanner passes the target-wide full param list so the single shared probe covers every chunk's params")
+
         flag.Parse()
         runCommandTimeout = *runCmdTimeoutFlag
+        probeCacheDir = *probeCacheFlag
+        reuseProbeDir = *reuseProbeFlag
+        probeParamsFile = *probeParamsFlag
 
         // WAF/block guard: wire up the global state from the parsed flags.
         blockCounterStart = *blockCounterStartFlag
@@ -3136,24 +3495,42 @@ func main() {
                 close(dispatcherDone)
         }()
 
-        for i, u := range urls {
-                fastWg.Add(1)
-                fastSem <- struct{}{}
-                go func(target string, idx int) {
-                        defer fastWg.Done()
-                        defer func() { <-fastSem }()
-                        defer func() {
-                                if r := recover(); r != nil {
-                                        logLine("ERROR", X_red, "panic processing %s: %v", target, r)
-                                }
-                        }()
-                        art := processURLFast(target, idx+1, len(urls))
-                        if art.Skip {
-                                return
-                        }
-                        artifactsChan <- art
-                }(u, i)
-        }
+	for i, u := range urls {
+		fastWg.Add(1)
+		fastSem <- struct{}{}
+		go func(target string, idx int) {
+			defer fastWg.Done()
+			defer func() { <-fastSem }()
+			defer func() {
+				if r := recover(); r != nil {
+					logLine("ERROR", X_red, "panic processing %s: %v", target, r)
+				}
+			}()
+			// Probe-once-per-path split: with -reuse-probe, skip the fresh
+			// phase-1..3 probe and load this path's artifacts from the probe
+			// cache (confirm restricted to the -p chunk); otherwise probe
+			// fresh (persisting the summary when -probe-cache is set; confirm
+			// unrestricted — legacy behavior, covering params that live in no
+			// chunk such as x9's built-in defaults).
+			var art ProbeArtifacts
+			if reuseProbeDir != "" {
+				art = loadProbeArtifacts(target, idx+1, len(urls), reuseProbeDir)
+			} else {
+				art = probeURL(target, idx+1, len(urls))
+			}
+			if art.Skip {
+				return
+			}
+			// Phase 3 (triage) stops after the probe — no confirm+attack,
+			// matching the old processURLFast's early return.
+			if phase == 3 {
+				artifactsChan <- art
+				return
+			}
+			confirmAndAttack(art, reuseProbeDir != "")
+			artifactsChan <- art
+		}(u, i)
+	}
         fastWg.Wait()
         close(artifactsChan)
         <-dispatcherDone

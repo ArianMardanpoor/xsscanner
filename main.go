@@ -630,6 +630,23 @@ func buildChunks(sortedParams []string, size int) [][]string {
 // runPathTest invokes xssniper against a single discovered path, feeding it
 // the given chunk param file via -p.
 //
+// probeMode drives the probe-once-per-path optimization:
+//
+//	""        legacy behavior — plain xssniper call, full pipeline per chunk
+//	"probe"   FIRST chunk of a path (under -probe-only-once): xssniper runs
+//	          the fresh phase-1..3 probe and persists its artifacts into
+//	          probeCacheDir (-probe-cache), then confirms its chunk
+//	"reuse"   LATER chunks of a path: xssniper skips the probe and loads the
+//	          artifacts from probeCacheDir (-reuse-probe), then confirms its
+//	          chunk (restricted to the chunk's params; the first chunk also
+//	          carries -probe-header-confirm for the header confirm loop)
+//
+// The probe half of an xssniper run (x9 probe-file generation +
+// curl_reflect_checker GET/JSON/header sweep + location check) costs
+// ~25-30s and is completely chunk-INDEPENDENT — repeating it per chunk
+// multiplied the per-path cost by the chunk count (the webapp.nozbe.com run:
+// 7 paths × 3 chunks = 21 full probes instead of 7 probes + 21 confirms).
+//
 // Returns (blockCounterEnd, blockDetected) — read from the -block-status-out
 // tmp JSON file xssniper writes at the end of its main(). The caller carries
 // blockCounterEnd forward to the next (path, chunk) xssniper call (or the
@@ -637,8 +654,8 @@ func buildChunks(sortedParams []string, size int) [][]string {
 // during this xssniper run and the caller must mark this path as waf-blocked
 // (stage="test", scope=<chunk key>) and abort the rest of the (path × chunk)
 // loop for this target.
-func runPathTest(path, paramFile, xssniperOutDir string, skipSPA bool, phase int, domScan bool, workers, fastWorkers int, blockCounterStart int64, blockThreshold int, scope string) (int64, bool) {
-        logMsg(fmt.Sprintf("[TEST] xssniper → %s (params: %s, scope: %s, block-counter-start=%d, threshold=%d)", path, filepath.Base(paramFile), scope, blockCounterStart, blockThreshold), M_cyan)
+func runPathTest(path, paramFile, xssniperOutDir string, skipSPA bool, phase int, domScan bool, workers, fastWorkers int, blockCounterStart int64, blockThreshold int, scope string, probeMode string, probeCacheDir string, probeParamsFile string) (int64, bool) {
+        logMsg(fmt.Sprintf("[TEST] xssniper → %s (params: %s, scope: %s, block-counter-start=%d, threshold=%d, probe: %s)", path, filepath.Base(paramFile), scope, blockCounterStart, blockThreshold, probeLabel(probeMode)), M_cyan)
 
         // Throwaway file xssniper writes its block-status JSON into (at the
         // very end of its main()). Read + removed right after use.
@@ -662,6 +679,23 @@ func runPathTest(path, paramFile, xssniperOutDir string, skipSPA bool, phase int
         args = append(args, "-phase", fmt.Sprintf("%d", phase))
         if domScan {
                 args = append(args, "-dom-scan")
+        }
+        // Probe-once wiring: hand xssniper the probe-cache flags per mode.
+        // The probing invocation gets -probe-params <full param list> so its
+        // single shared x9 probe canaries EVERY chunk's params (without it,
+        // later chunks' params would never receive a canary — the probe
+        // would only cover chunk 1); its confirm loop is unrestricted
+        // (legacy behavior, covering reflecting params that live in no
+        // chunk such as x9's built-in defaults). Reuse invocations skip the
+        // probe and confirm only their own chunk's params.
+        switch probeMode {
+        case "probe":
+                args = append(args, "-probe-cache", probeCacheDir)
+                if probeParamsFile != "" {
+                        args = append(args, "-probe-params", probeParamsFile)
+                }
+        case "reuse":
+                args = append(args, "-reuse-probe", probeCacheDir)
         }
         // Forward the global -cookie/-header auth flags to xssniper (it merges
         // them into every live curl request and passes them on to
@@ -698,6 +732,19 @@ func runPathTest(path, paramFile, xssniperOutDir string, skipSPA bool, phase int
                 return blockCounterStart, false
         }
         return status.BlockCounterEnd, status.BlockDetected
+}
+
+// probeLabel renders the probe mode for log lines ("" → "off (legacy
+// full-pipeline per chunk)").
+func probeLabel(probeMode string) string {
+        switch probeMode {
+        case "probe":
+                return "fresh (first chunk; artifacts cached for later chunks)"
+        case "reuse":
+                return "reuse cached artifacts (later chunk)"
+        default:
+                return "off (legacy full pipeline per chunk)"
+        }
 }
 
 // safeFileName turns a URL into a stable, filesystem-safe, length-capped stem
@@ -1148,7 +1195,7 @@ func cleanupIntermediateFiles(target, hostname, safeURL, jobFile string, discove
 // already recorded in <safeURL>-test-state.json are never re-tested. A chunk
 // whose content changed (because newly discovered params shifted chunk
 // boundaries) gets a new key and is retested; unchanged chunks stay skipped.
-func processTarget(target string, skipSPA bool, noCrawl bool, phase int, domScan bool, useKatana bool, workers int, fastWorkers int, chunkSize int, force bool, only bool, pathFileURLs []string, discoveryFileURLs []string, blockThreshold int, fallparamsDepth, fallparamsCrawlDuration int, retryBlocked bool) {
+func processTarget(target string, skipSPA bool, noCrawl bool, phase int, domScan bool, useKatana bool, workers int, fastWorkers int, chunkSize int, force bool, only bool, pathFileURLs []string, discoveryFileURLs []string, blockThreshold int, fallparamsDepth, fallparamsCrawlDuration int, retryBlocked bool, katanaBatchTimeout string, katanaLightMode bool, probeOnlyOnce bool) {
         logMsg(fmt.Sprintf("--- Starting: %s ---", target), M_purple+M_bold)
 
         u, err := url.Parse(target)
@@ -1235,7 +1282,19 @@ func processTarget(target string, skipSPA bool, noCrawl bool, phase int, domScan
                                 logMsg(fmt.Sprintf("[CACHE-SKIP katana] %s — nice_katana already completed for this target, reusing %s", target, filepath.Base(katanaOutFile)), M_green)
                         } else {
                                 logMsg(fmt.Sprintf("[2/3] Running nice_katana on input target for %s", target), M_gray)
-                                if err := runBinary("./nice_katana", withAuth([]string{"-o", crawlCacheDir, target})...); err != nil {
+                                // xsscanner-level crawl knobs: forwarded to the
+                                // nice_katana subprocess. -katana-batch-timeout /
+                                // -katana-light-mode mirror nice_katana's own
+                                // -batch-timeout / -light-mode flags (the crawl is
+                                // normally invoked from here, not by hand).
+                                katanaArgs := []string{"-o", crawlCacheDir, target}
+                                if katanaBatchTimeout != "" {
+                                        katanaArgs = append(katanaArgs, "-batch-timeout", katanaBatchTimeout)
+                                }
+                                if katanaLightMode {
+                                        katanaArgs = append(katanaArgs, "-light-mode")
+                                }
+                                if err := runBinary("./nice_katana", withAuth(katanaArgs)...); err != nil {
                                         // No .done on failure: the next run re-crawls.
                                         logMsg(fmt.Sprintf("nice_katana failed for %s: %v (no .done written; next run retries)", target, err), M_red)
                                 } else {
@@ -1263,6 +1322,21 @@ func processTarget(target string, skipSPA bool, noCrawl bool, phase int, domScan
                                                 // contributes zero URLs to the discovery merge either
                                                 // way, so re-running is harmless).
                                                 logMsg(fmt.Sprintf("nice_katana succeeded for %s but produced no staging file — no .done written (next run retries)", target), M_gray)
+                                        }
+                                }
+                                // nice_katana exits ZERO even when katana itself timed out or
+                                // failed (it logs the failure and returns without writing the
+                                // staging file). Either way no .done sentinel was written for THIS
+                                // attempt, but a katanaOutFile from a PREVIOUS successful run may
+                                // still sit in crawl_cache — and the discovery merge below happily
+                                // consumes it. Make that fallback LOUD so the run log never reads
+                                // as "fresh crawl results" when it is actually stale cache
+                                // (the webapp.nozbe.com 34m run hit exactly this: katana timed
+                                // out after 15m and the 6-URL discovery list silently came from
+                                // the previous run's cached -katana.txt).
+                                if !fileExists(katanaOutFile + ".done") && fileExists(katanaOutFile) {
+                                        if info, statErr := os.Stat(katanaOutFile); statErr == nil {
+                                                logMsg(fmt.Sprintf("[KATANA-TIMEOUT] %s: fresh crawl did not complete this run — falling back to cached %s (mtime %s, %d line(s)) for the discovery merge; discovery results may be incomplete/stale and the crawl will be retried on the next run", target, filepath.Base(katanaOutFile), info.ModTime().Format("2006-01-02 15:04:05"), countLines(katanaOutFile)), M_red)
                                         }
                                 }
                         }
@@ -1523,12 +1597,62 @@ func processTarget(target string, skipSPA bool, noCrawl bool, phase int, domScan
                 return true, fmt.Sprintf("chunk %s not yet tested for this path", key)
         }
 
+        // ── Probe-once-per-path support (-probe-only-once) ─────────────────────
+        //
+        // When enabled, the probe half of every xssniper run (x9 probe-file
+        // generation + curl_reflect_checker GET/JSON/header sweep + location
+        // check — ~25-30s, completely chunk-INDEPENDENT) runs ONCE per path:
+        // the first tested chunk probes fresh and persists the artifacts
+        // (xssniper -probe-cache), later chunks load them (-reuse-probe) and
+        // go straight to the chunk-scoped confirm+attack. Per-path cost drops
+        // from N_chunks × (probe+confirm) to probe + N_chunks × confirm.
+        //
+        // probeCacheDir is per-target (lives under xssniperOutDir, cleaned up
+        // with it); probeFirstChunk tracks whether a path's fresh probe has
+        // run yet THIS run. Resume interplay: a chunk skipped via test-state
+        // consumes nothing, so the first ACTUALLY-TESTED chunk of a path
+        // probes; chunks tested in PREVIOUS runs left no probe summary (the
+        // flag is new), so a partially-tested path that resumes mid-way
+        // probes once at its first newly-tested chunk. A stale summary from
+        // an interrupted same-day run is at worst a stale-but-valid probe of
+        // the same path (same target, same endpoints); correctness never
+        // depends on it (xssniper falls back to a fresh probe if the file is
+        // missing/corrupt).
+        probeCacheDir := ""
+        probeParamsListFile := ""
+        if probeOnlyOnce {
+                probeCacheDir = filepath.Join(xssniperOutDir, "probe_cache")
+                os.MkdirAll(probeCacheDir, 0755)
+                // The shared probe's param list = the full sorted aggregate.
+                // Written once here (chunk boundaries change between runs;
+                // the probe always re-covers the CURRENT full set, so a
+                // stale probe summary from an interrupted run is refreshed
+                // whenever the aggregate grows).
+                probeParamsListFile = filepath.Join(probeCacheDir, "probe_params.txt")
+        }
+        probeFirstChunk := make(map[string]bool) // path -> fresh probe already ran this run
+
         // testOneChunk runs xssniper for one (path, chunk) pair. Returns true
         // if WAF/block was detected during this test (caller must abort the
         // rest of the (path × chunk) loop for this target). Returns false
         // otherwise.
         testOneChunk := func(path, chunkKeyStr, paramFile string) bool {
-                counterEnd, blocked := runPathTest(path, paramFile, xssniperOutDir, skipSPA, phase, domScan, workers, fastWorkers, blockCounter, blockThreshold, chunkKeyStr)
+                // Probe mode for THIS (path, chunk) invocation:
+                //   probe-only-once OFF → "" (legacy: full pipeline per chunk)
+                //   first tested chunk of a path → "probe" (fresh probe + cache)
+                //   later chunks of a path → "reuse" (load cached artifacts)
+                probeMode := ""
+                if probeCacheDir != "" {
+                        if !probeFirstChunk[path] {
+                                probeMode = "probe"
+                        } else {
+                                probeMode = "reuse"
+                        }
+                }
+                counterEnd, blocked := runPathTest(path, paramFile, xssniperOutDir, skipSPA, phase, domScan, workers, fastWorkers, blockCounter, blockThreshold, chunkKeyStr, probeMode, probeCacheDir, probeParamsListFile)
+                if probeMode == "probe" {
+                        probeFirstChunk[path] = true
+                }
                 // Carry the counter forward regardless of outcome.
                 blockCounter = counterEnd
                 if blocked {
@@ -1599,6 +1723,20 @@ func processTarget(target string, skipSPA bool, noCrawl bool, phase int, domScan
                 sortedParams := sortedKeys(allDiscoveredParams)
                 chunks := buildChunks(sortedParams, chunkSize)
                 logMsg(fmt.Sprintf("Chunked test plan for %s: %d aggregate param(s) → %d chunk(s) of ≤%d param(s) × %d path(s)", target, len(sortedParams), len(chunks), chunkSize, len(discoveryList)), M_cyan)
+
+                // Probe-once: write the shared probe's param list (the full
+                // sorted aggregate) BEFORE the test loop, so the first
+                // probing invocation's x9 run canaries every chunk's params.
+                if probeParamsListFile != "" {
+                        if err := writeParamFile(probeParamsListFile, sortedParams); err != nil {
+                                // Never abort the run over this: xssniper
+                                // falls back to -p for the probe (chunk-only
+                                // probe coverage — same as the legacy per-chunk
+                                // probe, still correct, just less shared).
+                                logMsg(fmt.Sprintf("Failed to write probe params list %s: %v (probe will fall back to per-chunk -p)", probeParamsListFile, err), M_red)
+                                probeParamsListFile = ""
+                        }
+                }
 
                 for _, path := range discoveryList {
                         if isTestBlocked(path) {
@@ -1676,7 +1814,10 @@ func main() {
         phase := flag.Int("phase", 4, "Pipeline phase to stop at (2, 3, or 4)")
         domScan := flag.Bool("dom-scan", false, "Enable DOM/headless sink checks (passed through to xssniper; slow, off by default)")
         useKatana := flag.Bool("use-katana", true, "Run nice_katana crawl step (on by default; pass -use-katana=false to disable)")
+        katanaBatchTimeoutFlag := flag.String("katana-batch-timeout", "", "Global katana batch timeout as a Go duration (e.g. 10m, 90m, 2h), forwarded to nice_katana's -batch-timeout. Empty = nice_katana's default (15m per target, capped at 3h). Use a shorter value on heavy single targets so a doomed crawl fails fast instead of eating the whole budget, or a longer one when full crawl coverage matters more than wall-clock time")
+        katanaLightModeFlag := flag.Bool("katana-light-mode", false, "Forwarded to nice_katana's -light-mode: disable katana's -js-crawl, -jsluice and -automatic-form-fill (the dominant crawl-time cost on JS-heavy targets — the webapp.nozbe.com run hit the 15m timeout with exactly this profile). Coverage is reduced (JS-only and form-only params are missed); use when speed matters more than completeness")
         chunkSize := flag.Int("chunk", 50, "Number of parameters per chunk in the final test phase: after discovery completes, the target-wide aggregate parameter set is split into chunks of this size and every discovered path is tested against every chunk (one xssniper call per path×chunk pair). Replaces the old -allparam own/all model")
+        probeOnlyOnce := flag.Bool("probe-only-once", false, "Run the xssniper probe phase (x9 probe-file generation + curl_reflect_checker GET/JSON/header reflection sweep, ~25-30s and chunk-INDEPENDENT) only ONCE per path instead of once per (path, chunk) pair: the first tested chunk probes fresh and caches its artifacts (results/xssniper_out/<target>/probe_cache/), later chunks of the same path reuse them and go straight to the chunk-scoped confirm+attack. Per-path cost drops from N_chunks × (probe+confirm) to probe + N_chunks × confirm (e.g. the webapp.nozbe.com run: 21 full probes → 7 probes + 14 confirm-only runs). Default off preserves the legacy per-chunk full pipeline")
         force := flag.Bool("force", false, "Bypass the per-path resume cache: re-phase and re-test every path regardless of existing state files, and rebuild the state files fresh (stale entries are dropped, not merged)")
         only := flag.Bool("only", false, "Scan ONLY the input target URL itself: skip nice_passive and nice_katana entirely; each target's discovery list is just that one URL (still phased with nice_params and tested with xssniper). With -i, every line is its own independent single-URL target")
         pathFile := flag.String("path-file", "", "File of manually-curated RELATIVE paths (one per line, with or without query strings, e.g. /search?search=test); each line is joined with the -u scheme+host to build the discovery list (a full http(s):// line is used verbatim). Skips crawling entirely. Requires -u; mutually exclusive with -only; any -i is ignored with a warning (targets come from -u only)")
@@ -1871,7 +2012,7 @@ func main() {
 
         logMsg(fmt.Sprintf("Ready to process %d targets.", len(targets)), M_cyan)
         for _, target := range targets {
-                processTarget(target, *skipSPA, *noCrawl, *phase, *domScan, *useKatana, workers, fastWorkers, *chunkSize, *force, *only, pathFileURLs, discoveryFileURLs, *blockThreshold, *fallparamsDepth, *fallparamsCrawlDuration, *retryBlocked)
+                processTarget(target, *skipSPA, *noCrawl, *phase, *domScan, *useKatana, workers, fastWorkers, *chunkSize, *force, *only, pathFileURLs, discoveryFileURLs, *blockThreshold, *fallparamsDepth, *fallparamsCrawlDuration, *retryBlocked, *katanaBatchTimeoutFlag, *katanaLightModeFlag, *probeOnlyOnce)
         }
 
         mdPath := "results/TARGET_REPORT.md"
