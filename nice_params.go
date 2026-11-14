@@ -78,7 +78,7 @@ type Config struct {
 	// Depth/duration are exposed so xsscanner can forward its top-level
 	// -fallparams-depth / -fallparams-crawl-duration flags (same pattern
 	// as -block-threshold).
-	Crawl         bool // debug knob: default true; false disables the -crawl flag only
+	Crawl         bool // default false (scoped to the given URL only); true enables fallparams' -crawl flag for broader discovery
 	CrawlDepth    int  // forwarded as fallparams -d (default 2 = fallparams' own default, passed explicitly)
 	CrawlDuration int  // forwarded as fallparams -ct seconds (default 120 = 2 minutes; 0 = omit the flag and use fallparams' default)
 
@@ -429,11 +429,12 @@ func isCandidateWord(w string) bool {
 //   - -silent: ALWAYS passed. fallparams v1.0.12 panics in ShowBanner
 //     (index out of range) when the banner is printed in this environment;
 //     -silent skips the banner and the tool works.
-//   - -crawl: ALWAYS on now (the old -crawl opt-in flag survives only as a
-//     debug knob, default true; passing -crawl=false skips it — kept because
-//     the flag existed before and the user may want a fast no-crawl debug
-//     run, but the production default is crawl ON because crawl is what makes
-//     fallparams find real parameters on the target's linked pages).
+//   - -crawl: OFF by default now. The default behavior scopes fallparams'
+//     analysis to exactly the given URL (its own params/forms/JS), avoiding
+//     the large volume of unrelated JS-identifier noise crawl mode produces
+//     (e.g. 300+ candidates on a single target vs a handful of real
+//     params). Pass -crawl=true (cfg.Crawl) for broader multi-page discovery
+//     when that's explicitly wanted.
 //   - -d <CrawlDepth>: explicit crawl depth, default 2 (fallparams' own
 //     default — passed explicitly so it is visible/overridable from the CLI).
 //   - -ct <CrawlDuration>s: crawl duration cap, default 120s (2 minutes).
