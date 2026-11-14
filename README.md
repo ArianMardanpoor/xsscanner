@@ -164,7 +164,7 @@ go version
 
 ---
 
-## 3. نصب ابزارهای Go-based (katana, waybackurls, gau, subfinder, httpx, nuclei)
+## 3. نصب ابزارهای Go-based (katana, waybackurls, gau)
 
 ```bash
 # Katana (crawler اصلی nice_katana)
@@ -176,19 +176,11 @@ go install github.com/tomnomnom/waybackurls@latest
 # gau (passive discovery)
 go install github.com/lc/gau/v2/cmd/gau@latest
 
-# subfinder (subdomain enum - برای قبل از feed کردن target به xsscanner)
-go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-
-# httpx (برای فیلتر کردن subdomainهای زنده قبل از اسکن)
-go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-
-# nuclei (اختیاریه، کد چک می‌کنه هست یا نه ولی دیگه ضروری نیست)
-go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 ```
 
 بعد از نصب چک کن همه در PATH هستن:
 ```bash
-which katana waybackurls gau subfinder httpx nuclei
+which katana waybackurls gau
 ```
 
 ---
@@ -207,10 +199,8 @@ uro --help
 
 ## 5. نصب fallparams (موتور کشف پارامتر)
 
-> اگه fallparams توی گیت‌هاب پروژه‌ی خاصی داره که ازش استفاده می‌کنی، لینک ریپو رو جایگزین کن. الگوی نصب معمول پروژه‌های Go-based رو اینجا می‌ذارم:
-
 ```bash
-go install github.com/ReaJason/fallparams@latest
+go install github.com/ImAyrix/fallparams@latest
 # یا اگه از سورس خاصی نصبش می‌کنی:
 # git clone <fallparams-repo-url>
 # cd fallparams && go build -o fallparams .
