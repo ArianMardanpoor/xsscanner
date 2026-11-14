@@ -66,10 +66,15 @@ type Config struct {
 	MaxParams int
 	JSONOut   string // Optional: additionally write RAW per-URL discoveries as a JSON array (-json-out; both -u and -f modes)
 
-	// fallparams knobs. -crawl is ALWAYS passed to fallparams now (x8, the
-	// old non-crawl param-miner, was removed entirely: crawling the target
-	// is the only remaining server-side discovery mechanism, and the user
-	// explicitly wants crawl on for better results — see runFallparams).
+	// fallparams knobs. -crawl defaults to FALSE: by default nice_params asks
+	// fallparams to analyze only the exact URL given (its params, forms, JS on
+	// that single page) without crawling to other pages. This keeps the
+	// discovered parameter list tightly scoped to what's actually reachable on
+	// that page, instead of pulling in hundreds of unrelated JS identifiers and
+	// strings from every crawled page (which crawl mode does — see the
+	// webapp.nozbe.com test where -crawl returned 300+ candidates vs a handful
+	// of real form/query params without it). Pass -crawl=true explicitly for
+	// broader (but much noisier) discovery.
 	// Depth/duration are exposed so xsscanner can forward its top-level
 	// -fallparams-depth / -fallparams-crawl-duration flags (same pattern
 	// as -block-threshold).
@@ -872,7 +877,7 @@ func main() {
 	flag.IntVar(&cfg.Timeout, "timeout", 300, "Per-tool timeout in seconds")
 	flag.BoolVar(&cfg.NoFall, "no-fall", false, "Skip fallparams (debug: the only discovery engine — no params will be found)")
 	flag.IntVar(&cfg.MaxParams, "max-params", 200, "Maximum number of parameters to keep per host")
-	flag.BoolVar(&cfg.Crawl, "crawl", true, "Pass -crawl to fallparams (default true — crawl is fallparams' discovery engine; pass -crawl=false for a fast debug run with no crawl)")
+flag.BoolVar(&cfg.Crawl, "crawl", false, "Pass -crawl to fallparams (default FALSE — scans only the given URL itself without crawling linked pages; pass -crawl=true to enable crawl mode for broader-but-noisier discovery)")
 	flag.IntVar(&cfg.CrawlDepth, "fallparams-depth", 2, "Crawl depth forwarded to fallparams as -d (fallparams' own default, passed explicitly so it is overridable)")
 	flag.IntVar(&cfg.CrawlDuration, "fallparams-crawl-duration", 120, "Crawl duration cap in seconds forwarded to fallparams as -ct (bounds the per-URL phase cost; 0 = omit and use fallparams' default)")
 	flag.StringVar(&cfg.JSONOut, "json-out", "", "Additionally write RAW per-URL discoveries as a JSON array [{\"url\":…,\"params\":[…]}] (both -u and -f modes; unaffected by the <HOST>-param.txt merge/cap)")
