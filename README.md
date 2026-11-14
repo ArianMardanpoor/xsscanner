@@ -188,7 +188,7 @@ which katana waybackurls gau
 ## 4. نصب uro (پایتون - برای dedup معنایی URLها)
 
 ```bash
-pip3 install --user uro
+pip3 install --user uro  --break-system-packages
 echo 'export PATH=$PATH:$HOME/.local/bin' >> ~/.bashrc
 source ~/.bashrc
 
@@ -232,7 +232,7 @@ sudo snap install chromium
 
 ```bash
 mkdir -p ~/tools && cd ~/tools
-git clone <your-xsscanner-repo-url> xsscanner
+git clone https://github.com/ArianMardanpoor/xsscanner
 cd xsscanner
 
 go mod tidy
