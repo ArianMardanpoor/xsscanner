@@ -19,10 +19,279 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
+	"sort"
 	"strings"
 
 	"reconpipeline/utils"
 )
+
+// ── Structural collapse (path-shape clustering) ──────────────────────────────
+//
+// WHY: uro's semantic dedup only collapses URLs sharing the SAME path with
+// different query values. Real archive-sourced discovery lists (wayback/gau)
+// are dominated by structurally identical pages whose DIFFERENCE lives in the
+// path itself: paginated forums (/forum/section-1/page-53 ... page-88),
+// per-user profile paths (/for/<email>, /a-<username>), session-id paths
+// (/forum/sid-<hex32>), numbered content (/show/site-course4 ... course9) and
+// one copy per language prefix (/pl/login, /de/login, /jp/login...). On the
+// real webapp.nozbe.com list (892 URLs) these clusters are 119 + 72 + 70 + 38
+// + ... URLs deep, and uro keeps every one of them — the per-path test loop
+// then explodes (893 paths × 8 chunks = 7144 xssniper invocations).
+//
+// collapseSignature therefore clusters by STRUCTURE, not identity:
+//
+//	scheme+host normalized (http://H:80 ≡ https://H),
+//	each path segment with digits → digit-masked      (page-53 ≡ page-88),
+//	each path segment that is pure hex ≥16 chars → HEX (sid-<h> ≡ sid-<h>),
+//	each path segment containing '@' → EMAIL          (/for/a@b.c ≡ /for/x@y.z),
+//	first segment dropped when it is a throwaway prefix (language code or
+//	  app-group prefix: pl/de/jp/... gtd/app/web/...),
+//	query reduced to its sorted param-NAME set        (uro's own rule).
+//
+// One REPRESENTATIVE per cluster is kept — chosen to be the most informative
+// member (query-carrying beats bare, longer query beats shorter, then shortest
+// path, then first-seen). The rest are logged as dropped. This mirrors
+// xssniper's dedupBySignature (same idea, queryValueLength tie-break) but runs
+// at DISCOVERY time so the per-path phase and test loops never see the
+// duplicates.
+//
+// Safety properties:
+//   - the TARGET URL (line 0 of passive output) is never dropped;
+//   - representatives keep their ORIGINAL first-seen position in the list
+//     (resume-cache keys are exact URL strings — a re-run with the same input
+//     picks the same representatives, so paths-params.json stays stable);
+//   - a cluster never merges different param-NAME sets (uro rule preserved);
+//   - pure-informational segments (hex/email) collapse only in FULL (a half
+//     hex token would over-merge unrelated paths).
+//
+// collapseFirstSegment toggles rule 5 (default on via MergeAndFilter; tests
+// can disable it to assert the other rules in isolation).
+
+var (
+	rePureDigits  = regexp.MustCompile(`^[0-9]+$`)
+	rePureHex     = regexp.MustCompile(`^[0-9a-fA-F]{16,}$`)
+	reEmbedHex    = regexp.MustCompile(`[0-9a-fA-F]{16,}`)
+	reShortHexID  = regexp.MustCompile(`^(?:post|id|uid|pid|cid|nid|ref|hash|h)-[0-9a-fA-F]{6,}$`)
+	reHasDigit    = regexp.MustCompile(`[0-9]`)
+	reDigitsSub   = regexp.MustCompile(`[0-9]+`)
+	reLangSeg     = regexp.MustCompile(`^(?:lang|locale|loc|l)-[a-z]{2}(?:_[A-Z]{2})?$`)
+	reFlashMsgSeg = regexp.MustCompile(`^(?:error|msg|message|flash)-`)
+	reLangPrefix  = map[string]bool{} // filled below
+	reAppPrefixes = []string{"gtd", "app", "web", "www", "m", "mobile"}
+)
+
+func init() {
+	for _, l := range []string{
+		"en", "pl", "de", "fr", "es", "jp", "nl", "ru", "it", "pt", "cs",
+		"ko", "zh", "tr", "sv", "da", "fi", "no", "hu", "el", "he", "ar",
+		"hi", "th", "vi", "uk", "ro", "bg", "hr", "sk", "sl", "lt", "lv",
+		"et", "sr",
+	} {
+		reLangPrefix[l] = true
+	}
+}
+
+// maskSegment canonicalizes ONE path segment for the signature.
+func maskSegment(seg string) string {
+	if seg == "" {
+		return seg
+	}
+	if strings.Contains(seg, "@") {
+		return "EMAIL"
+	}
+	if rePureHex.MatchString(seg) {
+		return "HEX"
+	}
+	// Embedded long-hex tokens (sid-c21bec48...): mask the hex run itself so
+	// sid-<hex32> ≡ sid-<hex32> regardless of the token's prefix/suffix. A
+	// 16+ char hex run is never meaningful content — it is an id, a hash or
+	// a session token.
+	if reEmbedHex.MatchString(seg) {
+		seg = reEmbedHex.ReplaceAllString(seg, "H")
+	}
+	// Locale-carrying segments (/page/login/lang-pl ≡ /page/login/lang-jp)
+	// and flash-message segments (/login/error-... ≡ /login/msg-...): the
+	// segment carries presentation state, not endpoint identity.
+	if reLangSeg.MatchString(seg) {
+		return "LANG"
+	}
+	if reFlashMsgSeg.MatchString(seg) {
+		return "FLASH"
+	}
+	if rePureDigits.MatchString(seg) {
+		return "N"
+	}
+	if reHasDigit.MatchString(seg) {
+		return reDigitsSub.ReplaceAllString(seg, "N")
+	}
+	return seg
+}
+
+// isThrowawayPrefix reports whether the FIRST path segment is a language code
+// or an app-group prefix that carries no endpoint identity (/pl/login and
+// /jp/login are the same endpoint).
+func isThrowawayPrefix(seg string) bool {
+	s := strings.ToLower(seg)
+	if reLangPrefix[s] {
+		return true
+	}
+	for _, p := range reAppPrefixes {
+		if s == p {
+			return true
+		}
+	}
+	return false
+}
+
+// collapseSignature returns the structural signature of rawURL.
+func collapseSignature(rawURL string, collapseFirstSegment bool) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	host := strings.ToLower(u.Hostname())
+	segs := make([]string, 0, 4)
+	for _, s := range strings.Split(u.Path, "/") {
+		if s != "" {
+			segs = append(segs, s)
+		}
+	}
+	if collapseFirstSegment && len(segs) > 0 && isThrowawayPrefix(segs[0]) {
+		segs = segs[1:]
+	}
+	// Second masking round over the WHOLE segment list: recognize content-id
+	// segments (post-<hex>, id-<hex>...) anywhere in the path and (a) mask the
+	// id segment itself to a placeholder, (b) mask the TRAILING segment after
+	// it to a title-slug placeholder (/post-012a1c41/[suggest]_web_
+	// interface_improvements — the slug is pure content; every post shares
+	// the same endpoint shape). The slug rule fires ONLY after a recognized
+	// id segment so ordinary /a/b paths never lose their last segment.
+	for i := 0; i < len(segs); i++ {
+		if reShortHexID.MatchString(segs[i]) {
+			segs[i] = "ID"
+			if i+1 < len(segs) {
+				segs[len(segs)-1] = "SLUG"
+			}
+			break
+		}
+	}
+	var b strings.Builder
+	b.WriteString(host)
+	for _, s := range segs {
+		b.WriteByte('/')
+		b.WriteString(maskSegment(s))
+	}
+	// Param-NAME set only (uro's semantic rule): same endpoint with the same
+	// param names but different values collapses; different param sets never
+	// merge.
+	names := make([]string, 0, len(u.Query()))
+	for k := range u.Query() {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	if len(names) > 0 {
+		b.WriteByte('?')
+		b.WriteString(strings.Join(names, "&"))
+	}
+	return b.String()
+}
+
+// informativeScore ranks cluster members: the representative should be the
+// member most worth testing. Query-carrying beats bare (params are the whole
+// point of the pipeline), a richer query beats a thinner one, then the
+// shortest path (least noise), then first-seen. Lower tuple = better.
+func informativeScore(rawURL string, order int) []int {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return []int{1, 0, len(rawURL) + order}
+	}
+	qLen := 0
+	nParams := 0
+	for _, vals := range u.Query() {
+		nParams++
+		for _, v := range vals {
+			qLen += len(v)
+		}
+	}
+	noQuery := 1
+	if nParams > 0 {
+		noQuery = 0
+	}
+	return []int{noQuery, -qLen, len(u.Path) + order}
+}
+
+// sliceLess compares two int tuples lexicographically.
+func sliceLess(a, b []int) bool {
+	for i := range a {
+		if i >= len(b) {
+			return false
+		}
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
+}
+
+// collapseStructural clusters urls by collapseSignature and keeps one
+// representative per cluster, re-emitted in first-seen order. The first URL
+// of the input (the target itself per MergeAndFilter's contract) is always
+// kept. Returns the kept list and the number dropped.
+func collapseStructural(urls []string, collapseFirstSegment bool) ([]string, int) {
+	if len(urls) < 2 {
+		return urls, 0
+	}
+
+	type member struct {
+		url   string
+		order int
+	}
+	clusters := make(map[string][]member)
+	for i, u := range urls {
+		sig := collapseSignature(u, collapseFirstSegment)
+		clusters[sig] = append(clusters[sig], member{url: u, order: i})
+	}
+
+	// Choose the best member of each cluster.
+	best := make(map[string]string, len(clusters)) // sig -> representative
+	for sig, members := range clusters {
+		chosen := members[0]
+		chosenScore := informativeScore(chosen.url, chosen.order)
+		for _, m := range members[1:] {
+			if s := informativeScore(m.url, m.order); sliceLess(s, chosenScore) {
+				chosen = m
+				chosenScore = s
+			}
+		}
+		best[sig] = chosen.url
+	}
+
+	// Re-emit in first-seen order: position = the chosen member's own order.
+	type keptEntry struct {
+		url string
+		pos int
+	}
+	keptBySig := make(map[string]int, len(clusters)) // sig -> original index
+	for i, u := range urls {
+		sig := collapseSignature(u, collapseFirstSegment)
+		if _, ok := keptBySig[sig]; !ok {
+			keptBySig[sig] = i
+			_ = u
+		}
+	}
+	kept := make([]keptEntry, 0, len(best))
+	for sig, repURL := range best {
+		kept = append(kept, keptEntry{url: repURL, pos: keptBySig[sig]})
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].pos < kept[j].pos })
+
+	out := make([]string, 0, len(kept))
+	for _, e := range kept {
+		out = append(out, e.url)
+	}
+	return out, len(urls) - len(out)
+}
 
 // MergeAndFilter reads passiveFile and katanaFile (either may be missing/empty
 // — both cases are tolerated and treated as zero lines, no error returned),
@@ -140,6 +409,21 @@ func MergeAndFilter(passiveFile, katanaFile, inputTargetURL string) ([]string, e
 	// stderr and the exact-string-deduped list is returned unchanged — this
 	// helper never crashes the caller.
 	out = uroDedup(out)
+
+	// Structural (path-shape) collapse — the LAST dedup stage, after uro.
+	// uro only merges same-path/different-query URLs; archive lists are
+	// dominated by same-SHAPE/different-path duplicates (pagination,
+	// per-user paths, language copies) that survive both dedups above (see
+	// the collapseStructural doc for the real-target numbers: 892 → ~277).
+	// The input's first URL (the target itself) is never dropped, and the
+	// surviving representatives keep their first-seen order.
+	if len(out) > 1 {
+		var dropped int
+		out, dropped = collapseStructural(out, true)
+		if dropped > 0 {
+			fmt.Fprintf(os.Stderr, "[discoveryutil] structural collapse: dropped %d structurally-duplicate URL(s) (%d -> %d)\n", dropped, len(out)+dropped, len(out))
+		}
+	}
 
 	return out, nil
 }

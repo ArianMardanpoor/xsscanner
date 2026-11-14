@@ -1,32 +1,118 @@
-# xsscanner — deliverables (change 6: runtime — katana timeout visibility + probe-once-per-path)
+# xsscanner — deliverables (change 7: runtime — discovery-list explosion + structural collapse)
 
-This change attacks the two time sinks identified in the real-target run log
-(webapp.nozbe.com, 34m11s total):
-
-1. **katana timeout → silent stale-cache fallback** — the crawl hit the
-   15-minute batch timeout, `nice_katana` exited zero without writing its
-   staging file, and the discovery merge silently consumed the PREVIOUS run's
-   cached `-katana.txt` with no indication the results were stale. Plus the
-   timeout itself was a hardcoded formula with no knob, and the main cost
-   driver (`-js-crawl` + `-jsluice` + `-automatic-form-fill` all on) had no
-   speed-over-coverage escape hatch.
-2. **probe phase repeated per chunk** — for a fixed path, xssniper's
-   chunk-independent probe work (x9 probe-file generation + the
-   `curl_reflect_checker` GET/JSON/header sweep + location check, ~25-30s per
-   path) ran once per (path × chunk) pair instead of once per path: with
-   chunk size 50 and 138 aggregate params (3 chunks), every path's constant
-   cost was tripled — 7 paths × 3 chunks = 21 full probes instead of
-   7 probes + 14 confirm-only runs.
+This change fixes the path explosion revealed by the second real-target run
+(webapp.nozbe.com): real discovery (892 archive URLs from wayback/gau) fed
+893 paths into the per-path test loop, and with 387 aggregate params split
+into 8 chunks that meant **7144 planned xssniper invocations** (~50-90s each
+— an estimated 5+ DAYS of wall-clock). Root cause: the discovery merge's
+dedup layers (exact-string + uro's path+param-set) cannot collapse URLs whose
+difference lives in the PATH itself — and on a real archive list, almost all
+duplication lives exactly there.
 
 | File | What changed |
 |---|---|
-| `nice_katana.go` | **NEW FLAGS** `-batch-timeout <duration>` (override the 15m/target-capped-at-3h global batch timeout; invalid values fall back to the formula) and `-light-mode` (drop `-js-crawl`, `-jsluice` and `-automatic-form-fill` — the dominant crawl-time cost on JS-heavy targets; coverage is reduced, speed is not). Timeout/failure log lines now also report `light-mode=` status |
-| `main.go` | **NEW** `[KATANA-TIMEOUT]` loud warning when a failed/timed-out crawl falls back to a previous run's cached `-katana.txt` for the discovery merge (mtime + line count included, so stale results are never mistaken for fresh ones). **NEW FLAG** `-katana-batch-timeout` / `-katana-light-mode` forwarded to every nice_katana invocation. **NEW FLAG** `-probe-only-once` (see below). `runPathTest` gained the probe-mode handshake (`-probe-cache` on a path's first tested chunk, `-reuse-probe` on later chunks) |
-| `xsscanner_discover.go` | Same `[KATANA-TIMEOUT]` cache-fallback warning + `-katana-batch-timeout` / `-katana-light-mode` forwards as main.go (the two binaries share the crawl_cache, so both must warn identically) |
-| `xssniper.go` | **REFACTOR (Option A)**: `processURLFast` split into `populateFromProbeFiles`/`probeURL` (phases 1-3 only: probe generation + reflection sweep, chunk-independent) and `confirmAndAttack` (phase 4 only: confirmParameter + attack loop, chunk-scoped). NEW FLAGS `-probe-cache <dir>` / `-reuse-probe <dir>` / `-probe-params <file>` implement the probe-reuse handshake; a probe-summary JSON (`<safeName>-probe-summary.json`) carries the probe artifacts between invocations. Missing/corrupt summary → automatic fresh-probe fallback (reuse is an optimization, never a correctness dependency). Legacy no-flag behavior is byte-for-byte the old full pipeline |
-| `probeonce_test.go` | **NEW** — probe-summary round-trip (every field confirmAndAttack depends on survives write→load), on-disk JSON key contract (the -probe-cache/-reuse-probe handshake), missing/corrupt-summary fresh-probe fallback, skip-artifacts-never-cached |
+| `pkg/discoveryutil/discoveryutil.go` | **NEW `collapseStructural`** stage in `MergeAndFilter` (after uro): clusters URLs by structural signature — scheme/port normalized, digit runs masked (`page-53 ≡ page-88`), hex tokens ≥16 chars masked (`sid-<hex32> ≡ sid-<hex32>`, incl. embedded `post-<hex8>` + trailing title-slug masking), emails masked (`/for/<email>`), locale segments masked (`lang-pl ≡ lang-jp`), flash-message segments masked, and the FIRST path segment dropped when it is a language code or app-group prefix (`/pl/login ≡ /jp/login ≡ /gtd/login`). Query collapses to its param-NAME set (uro's own safety rule — different param sets NEVER merge). One representative per cluster, chosen most-informative-first (query-carrying > bare, richer query > thinner, shorter path, first-seen), re-emitted in first-seen order; the target URL is never dropped. **On the real nozbe list: 892 → 255 paths (71.5% reduction)** |
+| `main.go` | **NEW FLAG `-max-paths <n>`** (default 0 = uncapped, historical behavior): safety valve that caps how many discovered paths enter the per-path phase→test loop. Selection keeps the most informative paths (target first, then query-carrying sorted by query richness, then shallowest), preserves the original order, and logs the cap loudly. Cut paths stay in crawl_cache for a follow-up run |
+| `pkg/discoveryutil/discoveryutil_test.go` | **NEW TESTS** — nozbe-pattern unit coverage (pagination, email, sid-hex, courseN, lang-copies, scheme/port variants, param-name-set isolation, first-segment toggle) + end-to-end MergeAndFilter collapse |
+| `pkg/discoveryutil/collapse_nozbe_test.go` | **NEW** — validates `collapseStructural` against the REAL 892-URL capture from the run (skips itself if the capture file is absent; asserts 892 → ~255 and that every known explosion cluster collapses to exactly one representative) |
 
 ## What changed
+
+### 1) Why the discovery dedup missed everything (the evidence)
+The run log showed `Discovery: 892 unique scope-filtered URLs` — "unique"
+was technically true and practically useless. The three existing layers:
+- exact-string dedup — useless here: `http://H:80/pl/login` and
+  `https://H/jp/login` are different strings;
+- `uro` semantic dedup — merges only same-path/different-query URLs. On this
+  list only 22 URLs even HAVE a query string; the duplication is 100%
+  path-shaped: 119× `/gtd/forum/section-N/page-N`, 79× `/<lang>/for/<email>`,
+  63× `/<lang>/show/site-courseN`, 38× `/<lang>/forum/sid-<hex32>`, 47×
+  `/a-<username>`, 9 language copies each of `/login`, `/signup`,
+  `/forum`... uro keeps every one;
+- `IsGoodURL` — filters assets/numeric-only segments, not shapes.
+
+The fix adds a **structural collapse** stage (see table above). Verified
+against the real capture: **892 → 255** representatives — the pagination,
+email, sid, course and language clusters each collapse to exactly ONE
+representative, and genuinely distinct endpoints (`/api`, `/help`,
+`/sync3/...`, the `dev.`/`img.dev.` subdomain variants, distinct param-name
+sets) all survive. Representative selection prefers query-carrying URLs so
+the params the aggregate set is built from are preserved.
+
+### 2) `-max-paths`: the safety valve
+Structural collapse fixes THIS list, but a different target can still produce
+a legitimately large path set. `-max-paths <n>` bounds the worst case: the
+loop runs at most n paths, chosen most-informative-first (the cap ranks
+query-carrying paths above bare ones and shallower paths above deep ones,
+then restores the original list order so resume-cache keys stay stable). The
+cap logs loudly what it cut, and cut paths remain in `crawl_cache/` — a
+follow-up run with a higher cap (or a hand-curated `-path-file`) picks them
+up. Default 0 keeps the historical uncapped behavior.
+
+### 3) What this does to the nozbe run (arithmetic)
+| Stage | Before | After |
+|---|---|---|
+| discovery list | 893 paths | **255 paths** (structural collapse) — or fewer with `-max-paths` |
+| chunks (387 params / 50) | 8 | 8 (unchanged — but see below) |
+| xssniper invocations | 893 × 8 = **7144** full pipelines | 255 × 8 = 2040, and with `-probe-only-once`: **255 probes + 1785 confirm-only** runs |
+| est. wall-clock @ ~70s/invocation, ~12s per confirm-only | ~5.8 days | ~9h uncapped; **~2.5-3h with a sensible `-max-paths 100`** (100 paths → 100 probes + 700 confirms) |
+
+Recommended invocation for a target this size:
+```
+./xsscanner -u https://webapp.nozbe.com/ \
+  -katana-light-mode -katana-batch-timeout 20m \
+  -probe-only-once -chunk 100 -max-paths 100
+```
+(-chunk 100 folds 387 params into 4 chunks; -max-paths 100 keeps the
+informative hundred paths; -probe-only-once probes each once. 100 probes +
+300 confirm runs ≈ 2.5-4h instead of ~6 days.)
+
+## Build & test
+```
+bash build.sh
+go test ./pkg/reporter/ ./pkg/blockguard/ ./pkg/discoveryutil/
+go test xssniper.go probeonce_test.go
+```
+Manual e2e re-verified on the local selective-reflection server: structural
+collapse + probe-once compose correctly (per path: 1 fresh probe + N-1
+reuses), and `-max-paths 3` on a 5-path list picked exactly the 3
+query-carrying paths in original order with a loud `[MAX-PATHS]` log line.
+
+## Flags summary (this change)
+- xsscanner NEW: `-max-paths <int>` (default 0 = uncapped).
+- discoveryutil: no flags — the structural collapse is always-on in
+  `MergeAndFilter` (used by BOTH xsscanner and xsscanner_discover); its only
+  observable effect is fewer, more informative paths and one new log line
+  (`[discoveryutil] structural collapse: dropped N structurally-duplicate
+  URL(s) (X -> Y)`).
+- No changes to waf-blocked.json / paths-params.json / test-state.json
+  formats. Resume note: previously-tested paths that fall out of the
+  collapsed list simply keep their cached state; the discovery cache files
+  themselves (`crawl_cache/*.passive|-katana.txt`) are untouched.
+
+Change 6 (katana timeout visibility + probe-once-per-path) and earlier
+tables remain accurate for everything not touched here.
+
+---
+
+# Archived: change 6 details (katana timeout visibility + probe-once-per-path)
+
+**The problem pair that motivated change 6** (from the first 34m11s nozbe
+run): (1) katana hit its 15-minute batch timeout, exited zero without
+writing the staging file, and the discovery merge silently consumed the
+PREVIOUS run's cached `-katana.txt` — with no indication the results were
+stale; (2) xssniper's probe phase (x9 probe generation + the
+curl_reflect_checker GET/JSON/header sweep, ~25-30s, chunk-independent) ran
+once per (path × chunk) pair instead of once per path — 7 paths × 3 chunks
+= 21 full probes instead of 7 probes + 14 confirm-only runs.
+
+| File | What changed (change 6) |
+|---|---|
+| `nice_katana.go` | NEW `-batch-timeout <duration>` + `-light-mode` flags; timeout/failure lines report `light-mode=` |
+| `main.go` | `[KATANA-TIMEOUT]` stale-cache warning; `-katana-batch-timeout` / `-katana-light-mode` forwards; `-probe-only-once`; probe-mode handshake in `runPathTest` |
+| `xsscanner_discover.go` | Same warning + forwards as main.go |
+| `xssniper.go` | `processURLFast` split into `probeURL`/`populateFromProbeFiles` (phases 1-3) + `confirmAndAttack` (phase 4); NEW `-probe-cache <dir>` / `-reuse-probe <dir>` / `-probe-params <file>`; probe-summary JSON handshake with fresh-probe fallback |
+| `probeonce_test.go` | probe-summary round-trip, on-disk JSON key contract, fallback, skip-never-cached tests |
 
 ### 1) nice_katana: `-batch-timeout` and `-light-mode`
 - The global batch timeout was `15*len(targets)` minutes hard-capped at 3h
