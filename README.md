@@ -231,6 +231,7 @@ sudo snap install chromium
 ## 7. کلون کردن و بیلد پروژه
 
 ```bash
+cd /opt
 mkdir -p ~/tools && cd ~/tools
 git clone https://github.com/ArianMardanpoor/xsscanner
 cd xsscanner
