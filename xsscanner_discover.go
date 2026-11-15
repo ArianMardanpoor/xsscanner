@@ -229,55 +229,61 @@ func discoverTarget(target string, useKatana bool, force bool, katanaBatchTimeou
 		if fileExists(katanaOutFile) && fileExists(katanaOutFile+".done") && !force {
 			logMsg(fmt.Sprintf("[CACHE-SKIP katana] %s — nice_katana already completed for this target, reusing %s", target, filepath.Base(katanaOutFile)), D_green)
 		} else {
-                logMsg(fmt.Sprintf("[2/2] Running nice_katana on input target for %s", target), D_gray)
-                // -cookie/-header ARE forwarded here (nice_katana makes live requests
-                // against the target — same scope as xsscanner's nice_katana call).
-                // The -batch-timeout / -light-mode crawl knobs mirror xsscanner's
-                // -katana-batch-timeout / -katana-light-mode forwards.
-                katanaArgs := []string{"-o", crawlCacheDir, target}
-                if katanaBatchTimeout != "" {
-                        katanaArgs = append(katanaArgs, "-batch-timeout", katanaBatchTimeout)
-                }
-                if katanaLightMode {
-                        katanaArgs = append(katanaArgs, "-light-mode")
-                }
-                if err := runBinary("./nice_katana", withAuth(katanaArgs)...); err != nil {
-                        // No .done on failure: the next run re-crawls.
-                        logMsg(fmt.Sprintf("nice_katana failed for %s: %v (no .done written; next run retries)", target, err), D_red)
-                } else {
-                        // nice_katana writes its crawl output to a shared
-                        // "katana_batch_output.txt" staging file. Move it to this target's
-                        // dedicated output file (inside the same crawl_cache dir) so the
-                        // discovery-merge step below (and a later xsscanner run) can
-                        // consume it deterministically.
-                        batchFile := filepath.Join(crawlCacheDir, "katana_batch_output.txt")
-                        if _, statErr := os.Stat(batchFile); statErr == nil {
-                                if renameErr := os.Rename(batchFile, katanaOutFile); renameErr != nil {
-                                        logMsg(fmt.Sprintf("Failed to move katana batch output to %s: %v (no .done written; next run retries)", katanaOutFile, renameErr), D_red)
-                                } else if countLines(katanaOutFile) > 0 {
-                                        // .done ONLY on: subprocess success AND non-empty output file.
-                                        writeDone(katanaOutFile + ".done")
-                                } else {
-                                        logMsg(fmt.Sprintf("nice_katana succeeded for %s but %s is empty — no .done written (next run retries)", target, filepath.Base(katanaOutFile)), D_gray)
-                                }
-                        } else {
-                                // Subprocess succeeded but wrote no staging file at all
-                                // (a crawl that finished with zero results). Treat
-                                // identically to the empty-output case: no .done written,
-                                // next run retries (an empty katana file contributes zero
-                                // URLs to the discovery merge either way, so re-running is
-                                // harmless).
-                                logMsg(fmt.Sprintf("nice_katana succeeded for %s but produced no staging file — no .done written (next run retries)", target), D_gray)
-                        }
-                }
-                // Mirror xsscanner's KATANA-TIMEOUT cache-fallback warning: nice_katana
-                // exits ZERO even when katana itself timed out/failed, and a stale
-                // katanaOutFile from a previous run would silently feed the merge below.
-                if !fileExists(katanaOutFile+".done") && fileExists(katanaOutFile) {
-                        if info, statErr := os.Stat(katanaOutFile); statErr == nil {
-                                logMsg(fmt.Sprintf("[KATANA-TIMEOUT] %s: fresh crawl did not complete this run — falling back to cached %s (mtime %s, %d line(s)) for the discovery merge; discovery results may be incomplete/stale and the crawl will be retried on the next run", target, filepath.Base(katanaOutFile), info.ModTime().Format("2006-01-02 15:04:05"), countLines(katanaOutFile)), D_red)
-                        }
-                }
+			logMsg(fmt.Sprintf("[2/2] Running nice_katana on input target for %s", target), D_gray)
+			// -cookie/-header ARE forwarded here (nice_katana makes live requests
+			// against the target — same scope as xsscanner's nice_katana call).
+			// The -batch-timeout / -light-mode crawl knobs mirror xsscanner's
+			// -katana-batch-timeout / -katana-light-mode forwards.
+			//
+			// ORDER MATTERS: Go's flag package stops parsing at the first
+			// non-flag argument, so the positional target MUST be the LAST
+			// argument (see the same fix in xsscanner's main.go — flags
+			// appended after the target were silently never parsed).
+			katanaArgs := []string{"-o", crawlCacheDir}
+			if katanaBatchTimeout != "" {
+				katanaArgs = append(katanaArgs, "-batch-timeout", katanaBatchTimeout)
+			}
+			if katanaLightMode {
+				katanaArgs = append(katanaArgs, "-light-mode")
+			}
+			katanaArgs = append(katanaArgs, target)
+			if err := runBinary("./nice_katana", withAuth(katanaArgs)...); err != nil {
+				// No .done on failure: the next run re-crawls.
+				logMsg(fmt.Sprintf("nice_katana failed for %s: %v (no .done written; next run retries)", target, err), D_red)
+			} else {
+				// nice_katana writes its crawl output to a shared
+				// "katana_batch_output.txt" staging file. Move it to this target's
+				// dedicated output file (inside the same crawl_cache dir) so the
+				// discovery-merge step below (and a later xsscanner run) can
+				// consume it deterministically.
+				batchFile := filepath.Join(crawlCacheDir, "katana_batch_output.txt")
+				if _, statErr := os.Stat(batchFile); statErr == nil {
+					if renameErr := os.Rename(batchFile, katanaOutFile); renameErr != nil {
+						logMsg(fmt.Sprintf("Failed to move katana batch output to %s: %v (no .done written; next run retries)", katanaOutFile, renameErr), D_red)
+					} else if countLines(katanaOutFile) > 0 {
+						// .done ONLY on: subprocess success AND non-empty output file.
+						writeDone(katanaOutFile + ".done")
+					} else {
+						logMsg(fmt.Sprintf("nice_katana succeeded for %s but %s is empty — no .done written (next run retries)", target, filepath.Base(katanaOutFile)), D_gray)
+					}
+				} else {
+					// Subprocess succeeded but wrote no staging file at all
+					// (a crawl that finished with zero results). Treat
+					// identically to the empty-output case: no .done written,
+					// next run retries (an empty katana file contributes zero
+					// URLs to the discovery merge either way, so re-running is
+					// harmless).
+					logMsg(fmt.Sprintf("nice_katana succeeded for %s but produced no staging file — no .done written (next run retries)", target), D_gray)
+				}
+			}
+			// Mirror xsscanner's KATANA-TIMEOUT cache-fallback warning: nice_katana
+			// exits ZERO even when katana itself timed out/failed, and a stale
+			// katanaOutFile from a previous run would silently feed the merge below.
+			if !fileExists(katanaOutFile+".done") && fileExists(katanaOutFile) {
+				if info, statErr := os.Stat(katanaOutFile); statErr == nil {
+					logMsg(fmt.Sprintf("[KATANA-TIMEOUT] %s: fresh crawl did not complete this run — falling back to cached %s (mtime %s, %d line(s)) for the discovery merge; discovery results may be incomplete/stale and the crawl will be retried on the next run", target, filepath.Base(katanaOutFile), info.ModTime().Format("2006-01-02 15:04:05"), countLines(katanaOutFile)), D_red)
+				}
+			}
 		}
 	} else {
 		logMsg(fmt.Sprintf("Katana disabled (-use-katana=false), skipping crawl for %s", target), D_gray)
@@ -318,9 +324,9 @@ func main() {
 	inputFile := flag.String("i", "", "Input file with targets (one URL per line)")
 	targetURL := flag.String("u", "", "Single target URL to discover")
 	outDir := flag.String("o", "results/discovery", "Output directory for the final per-target discovery file (<safeName>-discovered.txt)")
-        useKatana := flag.Bool("use-katana", true, "Run nice_katana crawl step (on by default; pass -use-katana=false to disable)")
-        katanaBatchTimeoutFlag := flag.String("katana-batch-timeout", "", "Global katana batch timeout as a Go duration (e.g. 10m, 90m, 2h), forwarded to nice_katana's -batch-timeout. Empty = nice_katana's default (15m per target, capped at 3h)")
-        katanaLightModeFlag := flag.Bool("katana-light-mode", false, "Forwarded to nice_katana's -light-mode: disable katana's -js-crawl, -jsluice and -automatic-form-fill (dominant crawl-time cost on JS-heavy targets). Coverage is reduced; use when speed matters more than completeness")
+	useKatana := flag.Bool("use-katana", true, "Run nice_katana crawl step (on by default; pass -use-katana=false to disable)")
+	katanaBatchTimeoutFlag := flag.String("katana-batch-timeout", "", "Global katana batch timeout as a Go duration (e.g. 10m, 90m, 2h), forwarded to nice_katana's -batch-timeout. Empty = nice_katana's default (15m per target, capped at 3h)")
+	katanaLightModeFlag := flag.Bool("katana-light-mode", false, "Forwarded to nice_katana's -light-mode: disable katana's -js-crawl, -jsluice and -automatic-form-fill (dominant crawl-time cost on JS-heavy targets). Coverage is reduced; use when speed matters more than completeness")
 	cookie := flag.String("cookie", "", "Raw Cookie header value forwarded ONLY to the nice_katana crawl subprocess (nice_passive is never given auth — it only queries third-party archives, never the target), e.g. \"session=abc123; other=val\"")
 	var headers headerList
 	flag.Var(&headers, "header", "Extra HTTP header forwarded ONLY to the nice_katana crawl subprocess, format \"Name: Value\" (repeatable, order preserved). nice_passive is never given auth.")
@@ -381,9 +387,9 @@ func main() {
 	}
 
 	logMsg(fmt.Sprintf("Ready to discover %d targets.", len(targets)), D_cyan)
-        for _, target := range targets {
-                discoverTarget(target, *useKatana, *force, *katanaBatchTimeoutFlag, *katanaLightModeFlag)
-        }
+	for _, target := range targets {
+		discoverTarget(target, *useKatana, *force, *katanaBatchTimeoutFlag, *katanaLightModeFlag)
+	}
 	logMsg(fmt.Sprintf("Done. %d targets processed. Discovery files in %s/", len(targets), discoveryOutputDir), D_green)
 
 	// NOTE: intentionally NO call to anything from reporter / Telegram /

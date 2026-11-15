@@ -1360,13 +1360,21 @@ func processTarget(target string, skipSPA bool, noCrawl bool, phase int, domScan
 				// -katana-light-mode mirror nice_katana's own
 				// -batch-timeout / -light-mode flags (the crawl is
 				// normally invoked from here, not by hand).
-				katanaArgs := []string{"-o", crawlCacheDir, target}
+				//
+				// ORDER MATTERS: Go's flag package stops parsing at the
+				// first non-flag argument, so the positional target MUST be
+				// the LAST argument. Appending flags after the target made
+				// them silently unparsed (the bug behind "light-mode=false,
+				// batch-timeout=15m0s" showing up in STARTUP despite
+				// -katana-light-mode -katana-batch-timeout being passed).
+				katanaArgs := []string{"-o", crawlCacheDir}
 				if katanaBatchTimeout != "" {
 					katanaArgs = append(katanaArgs, "-batch-timeout", katanaBatchTimeout)
 				}
 				if katanaLightMode {
 					katanaArgs = append(katanaArgs, "-light-mode")
 				}
+				katanaArgs = append(katanaArgs, target)
 				if err := runBinary("./nice_katana", withAuth(katanaArgs)...); err != nil {
 					// No .done on failure: the next run re-crawls.
 					logMsg(fmt.Sprintf("nice_katana failed for %s: %v (no .done written; next run retries)", target, err), M_red)

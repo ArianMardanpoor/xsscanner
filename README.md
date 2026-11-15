@@ -1,4 +1,4 @@
-# xsscanner — deliverables (change 7: runtime — discovery-list explosion + structural collapse)
+# xsscanner — deliverables (change 7: runtime — discovery-list explosion + structural collapse + flag-forward fix)
 
 This change fixes the path explosion revealed by the second real-target run
 (webapp.nozbe.com): real discovery (892 archive URLs from wayback/gau) fed
@@ -7,12 +7,15 @@ into 8 chunks that meant **7144 planned xssniper invocations** (~50-90s each
 — an estimated 5+ DAYS of wall-clock). Root cause: the discovery merge's
 dedup layers (exact-string + uro's path+param-set) cannot collapse URLs whose
 difference lives in the PATH itself — and on a real archive list, almost all
-duplication lives exactly there.
+duplication lives exactly there. A follow-up real-run log then exposed a
+second bug — change 6's `-katana-batch-timeout`/`-katana-light-mode` forwards
+never actually reached nice_katana (see §3) — fixed here too.
 
 | File | What changed |
 |---|---|
 | `pkg/discoveryutil/discoveryutil.go` | **NEW `collapseStructural`** stage in `MergeAndFilter` (after uro): clusters URLs by structural signature — scheme/port normalized, digit runs masked (`page-53 ≡ page-88`), hex tokens ≥16 chars masked (`sid-<hex32> ≡ sid-<hex32>`, incl. embedded `post-<hex8>` + trailing title-slug masking), emails masked (`/for/<email>`), locale segments masked (`lang-pl ≡ lang-jp`), flash-message segments masked, and the FIRST path segment dropped when it is a language code or app-group prefix (`/pl/login ≡ /jp/login ≡ /gtd/login`). Query collapses to its param-NAME set (uro's own safety rule — different param sets NEVER merge). One representative per cluster, chosen most-informative-first (query-carrying > bare, richer query > thinner, shorter path, first-seen), re-emitted in first-seen order; the target URL is never dropped. **On the real nozbe list: 892 → 255 paths (71.5% reduction)** |
-| `main.go` | **NEW FLAG `-max-paths <n>`** (default 0 = uncapped, historical behavior): safety valve that caps how many discovered paths enter the per-path phase→test loop. Selection keeps the most informative paths (target first, then query-carrying sorted by query richness, then shallowest), preserves the original order, and logs the cap loudly. Cut paths stay in crawl_cache for a follow-up run |
+| `main.go` | **NEW FLAG `-max-paths <n>`** (default 0 = uncapped, historical behavior): safety valve that caps how many discovered paths enter the per-path phase→test loop. Selection keeps the most informative paths (target first, then query-carrying sorted by query richness, then shallowest), preserves the original order, and logs the cap loudly. Cut paths stay in crawl_cache for a follow-up run. **FIX: katana arg order** — the positional target now comes AFTER `-batch-timeout`/`-light-mode` (Go's flag package stops parsing at the first non-flag argument; flags appended after the target were silently never parsed) |
+| `xsscanner_discover.go` | **Same katana arg-order fix** as main.go |
 | `pkg/discoveryutil/discoveryutil_test.go` | **NEW TESTS** — nozbe-pattern unit coverage (pagination, email, sid-hex, courseN, lang-copies, scheme/port variants, param-name-set isolation, first-segment toggle) + end-to-end MergeAndFilter collapse |
 | `pkg/discoveryutil/collapse_nozbe_test.go` | **NEW** — validates `collapseStructural` against the REAL 892-URL capture from the run (skips itself if the capture file is absent; asserts 892 → ~255 and that every known explosion cluster collapses to exactly one representative) |
 
@@ -49,7 +52,10 @@ cap logs loudly what it cut, and cut paths remain in `crawl_cache/` — a
 follow-up run with a higher cap (or a hand-curated `-path-file`) picks them
 up. Default 0 keeps the historical uncapped behavior.
 
-### 3) What this does to the nozbe run (arithmetic)
+### 3) The flag-forward bug the follow-up run exposed (fixed)
+The first post-change-7 run printed `[STARTUP] ... (light-mode=false, batch-timeout=15m0s)` despite `-katana-light-mode -katana-batch-timeout 20m` being passed. Cause: `katanaArgs` was built as `["-o", dir, TARGET]` with the forwarded flags APPENDED after the target — and Go's flag package stops parsing at the first non-flag argument, so `nice_katana` received the flags as inert positional noise and never parsed them. Both call sites (main.go and xsscanner_discover.go) now put the positional target LAST. Verified end-to-end: the STARTUP line now reads `light-mode=true, batch-timeout=20m0s (override)`. Note for reading run logs: the `892` in the `[1/3] nice_passive` stage is the RAW archive count (that stage's own output line, written before the merge) — the collapse happens later in STEP C, where the log now shows `[discoveryutil] structural collapse: dropped N structurally-duplicate URL(s) (X -> Y)` followed by `Discovery: Y unique scope-filtered URLs`.
+
+### 4) What this does to the nozbe run (arithmetic)
 | Stage | Before | After |
 |---|---|---|
 | discovery list | 893 paths | **255 paths** (structural collapse) — or fewer with `-max-paths` |
