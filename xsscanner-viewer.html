@@ -1,0 +1,1490 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XSScanner Results Viewer</title>
+<style>
+:root{
+  --bg:#0b0f17; --panel:#111827; --panel2:#0d1420; --border:#1f2a3a;
+  --text:#e5e7eb; --muted:#94a3b8; --accent:#38bdf8; --accent2:#0ea5e9;
+  --green:#34d399; --red:#f87171; --amber:#fbbf24; --purple:#a78bfa; --cyan:#22d3ee;
+  --mono:ui-monospace,'Cascadia Code',Consolas,'Courier New',monospace;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font-family:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
+  font-size:15px;line-height:1.75;
+  background-image:radial-gradient(1200px 500px at 85% -10%,rgba(56,189,248,.07),transparent),
+                   radial-gradient(900px 400px at 10% -10%,rgba(167,139,250,.05),transparent);
+}
+.wrap{max-width:1280px;margin-inline:auto;padding-inline:clamp(10px,3vw,24px)}
+a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+.ltr{direction:ltr;text-align:left;font-family:var(--mono)}
+code,pre{font-family:var(--mono)}
+
+/* ---------- header ---------- */
+header.app{
+  position:sticky;top:0;z-index:40;background:rgba(11,15,23,.86);
+  backdrop-filter:blur(10px);border-bottom:1px solid var(--border);
+}
+.head{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding-block:12px}
+.brand{font-size:clamp(1.05rem,2.6vw,1.35rem);font-weight:800;letter-spacing:.2px}
+.brand .shield{color:var(--accent)}
+.headstats{display:flex;flex-wrap:wrap;gap:6px;margin-inline-start:auto}
+.hstat{background:var(--panel2);border:1px solid var(--border);border-radius:999px;
+  padding:3px 12px;font-size:.78rem;color:var(--muted)}
+.hstat b{color:var(--text);font-family:var(--mono)}
+.tabs{display:flex;gap:4px;overflow-x:auto;padding-bottom:0;scrollbar-width:thin}
+.tab{
+  appearance:none;border:1px solid transparent;border-bottom:none;background:transparent;color:var(--muted);
+  font:inherit;font-size:.88rem;font-weight:600;padding:9px 16px;border-radius:12px 12px 0 0;cursor:pointer;
+  white-space:nowrap;transition:.15s;
+}
+.tab:hover{color:var(--text);background:rgba(56,189,248,.06)}
+.tab.active{color:var(--accent);background:var(--panel);border-color:var(--border);
+  box-shadow:inset 0 2px 0 var(--accent)}
+
+/* ---------- toolbar ---------- */
+.toolbar{
+  display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+  background:var(--panel);border:1px solid var(--border);border-radius:14px;
+  padding:12px 14px;margin-block:16px;
+}
+.toolbar .spacer{flex:1}
+.btn{
+  appearance:none;font:inherit;font-size:.85rem;font-weight:600;cursor:pointer;
+  background:var(--panel2);color:var(--text);border:1px solid var(--border);
+  border-radius:10px;padding:8px 14px;transition:.15s;white-space:nowrap;
+}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn.primary{background:linear-gradient(135deg,var(--accent2),#0369a1);border-color:transparent;color:#fff}
+.btn.primary:hover{filter:brightness(1.12)}
+.btn.danger:hover{border-color:var(--red);color:var(--red)}
+.btn.small{padding:4px 10px;font-size:.76rem;border-radius:8px}
+.btn.icon{padding:6px 10px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;width:100%}
+.chip{
+  display:inline-flex;align-items:center;gap:6px;font-size:.74rem;
+  background:var(--panel2);border:1px solid var(--border);border-radius:999px;padding:3px 10px;color:var(--muted);
+}
+.chip.ok{border-color:rgba(52,211,153,.4);color:var(--green)}
+.chip.err{border-color:rgba(248,113,113,.4);color:var(--red)}
+.chip .x{cursor:pointer;font-weight:800;color:var(--muted)} .chip .x:hover{color:var(--red)}
+.hint{font-size:.78rem;color:var(--muted)}
+
+/* ---------- layout ---------- */
+main{padding-bottom:70px}
+.tabpane{display:none;animation:fade .18s ease}
+.tabpane.active{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:clamp(12px,2.5vw,20px);margin-block:14px}
+.panel>h3{margin:0 0 12px;font-size:1rem;display:flex;align-items:center;gap:8px}
+.panel>h3 .ico{font-size:1.1rem}
+.sub{color:var(--muted);font-size:.8rem;margin:0 0 12px}
+
+/* ---------- KPI cards ---------- */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-block:14px}
+.kpi{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:14px 16px;position:relative;overflow:hidden}
+.kpi::after{content:'';position:absolute;inset-inline:0;top:0;height:3px;background:var(--accent);opacity:.75}
+.kpi.g::after{background:var(--green)} .kpi.r::after{background:var(--red)}
+.kpi.a::after{background:var(--amber)} .kpi.p::after{background:var(--purple)}
+.kpi .lbl{font-size:.78rem;color:var(--muted)}
+.kpi .v{font-size:clamp(1.35rem,3.4vw,1.9rem);font-weight:800;font-family:var(--mono)}
+.kpi .d{font-size:.72rem;color:var(--muted)}
+
+/* ---------- bars / charts ---------- */
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;min-width:0}
+.grid2>*{min-width:0}
+@media(max-width:860px){.grid2{grid-template-columns:1fr}}
+.panel pre.code{max-width:100%;overflow-x:auto}
+.bar-row{display:grid;grid-template-columns:minmax(80px,200px) 1fr 52px;gap:10px;align-items:center;margin-block:7px;font-size:.8rem}
+.bar-row .lbl{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-row .track{background:var(--panel2);border-radius:8px;height:12px;overflow:hidden}
+.bar-row .fill{height:100%;border-radius:8px;background:linear-gradient(90deg,var(--accent2),var(--accent));min-width:2px;transition:width .4s}
+.bar-row .fill.g{background:linear-gradient(90deg,#059669,var(--green))}
+.bar-row .fill.a{background:linear-gradient(90deg,#d97706,var(--amber))}
+.bar-row .fill.r{background:linear-gradient(90deg,#dc2626,var(--red))}
+.bar-row .fill.p{background:linear-gradient(90deg,#7c3aed,var(--purple))}
+.bar-row .num{font-family:var(--mono);color:var(--text)}
+.donutwrap{display:flex;flex-wrap:wrap;gap:18px;align-items:center}
+.donut{width:150px;max-width:40vw;aspect-ratio:1;border-radius:50%;position:relative;flex:none}
+.donut::after{content:'';position:absolute;inset:22%;background:var(--panel);border-radius:50%}
+.donut .cval{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:1}
+.donut .cval b{font-size:1.25rem;font-family:var(--mono)}
+.donut .cval span{font-size:.66rem;color:var(--muted)}
+.legend{display:flex;flex-direction:column;gap:7px;font-size:.8rem}
+.legend .li{display:flex;align-items:center;gap:8px}
+.legend .sw{width:11px;height:11px;border-radius:3px;flex:none}
+
+/* ---------- tables ---------- */
+.tblwrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:var(--panel2)}
+table.tbl{width:100%;border-collapse:collapse;min-width:820px;font-size:.84rem}
+.tbl th{
+  text-align:left;padding:10px 12px;background:#0a1019;color:var(--muted);
+  font-size:.74rem;font-weight:700;border-bottom:1px solid var(--border);white-space:nowrap;position:sticky;top:0;
+}
+.tbl td{padding:8px 12px;border-bottom:1px solid rgba(31,42,58,.65);vertical-align:middle}
+.tbl tbody tr:hover{background:rgba(56,189,248,.045)}
+.tbl tbody tr.clickable{cursor:pointer}
+.tbl .num{font-family:var(--mono)}
+.urlcell{font-family:var(--mono);font-size:.76rem;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hide-sm{}
+@media(max-width:760px){.hide-sm{display:none}}
+
+/* ---------- badges ---------- */
+.b{display:inline-block;font-size:.68rem;font-weight:700;border-radius:999px;padding:2px 9px;border:1px solid transparent;white-space:nowrap}
+.b-green{background:rgba(52,211,153,.12);color:var(--green);border-color:rgba(52,211,153,.35)}
+.b-red{background:rgba(248,113,113,.12);color:var(--red);border-color:rgba(248,113,113,.35)}
+.b-amber{background:rgba(251,191,36,.12);color:var(--amber);border-color:rgba(251,191,36,.35)}
+.b-blue{background:rgba(56,189,248,.12);color:var(--accent);border-color:rgba(56,189,248,.35)}
+.b-purple{background:rgba(167,139,250,.13);color:var(--purple);border-color:rgba(167,139,250,.35)}
+.b-gray{background:rgba(148,163,184,.1);color:var(--muted);border-color:rgba(148,163,184,.3)}
+
+/* ---------- filters ---------- */
+.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}
+input,select,textarea{
+  font:inherit;background:var(--panel2);color:var(--text);border:1px solid var(--border);
+  border-radius:10px;padding:8px 12px;outline:none;width:100%;transition:.15s;
+}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+textarea{min-height:170px;resize:vertical;font-family:var(--mono);font-size:.8rem}
+
+/* ---------- modal ---------- */
+.modal{position:fixed;inset:0;background:rgba(2,6,16,.75);backdrop-filter:blur(4px);
+  display:none;align-items:center;justify-content:center;padding:14px;z-index:60}
+.modal.open{display:flex}
+.modal .box{background:var(--panel);border:1px solid var(--border);border-radius:16px;
+  max-width:880px;width:100%;max-height:88vh;overflow:auto;box-shadow:0 30px 80px rgba(0,0,0,.55)}
+.modal .mhead{position:sticky;top:0;background:var(--panel);border-bottom:1px solid var(--border);
+  padding:14px 18px;display:flex;align-items:center;gap:10px;z-index:2}
+.modal .mhead h3{margin:0;font-size:.95rem;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mbody{padding:16px 18px}
+.mrow{margin-bottom:14px}
+.mrow .k{font-size:.74rem;color:var(--muted);margin-bottom:4px}
+.mrow .v{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:8px 12px;font-size:.84rem;word-break:break-all}
+pre.code{background:#070b12;border:1px solid var(--border);border-radius:10px;padding:12px;
+  overflow-x:auto;font-size:.76rem;line-height:1.6;margin:0}
+.triage{display:flex;flex-wrap:wrap;gap:8px}
+.tri-btn{font-size:.8rem;font-weight:700;border-radius:10px;padding:7px 16px;cursor:pointer;border:1px solid var(--border);background:var(--panel2);color:var(--muted)}
+.tri-btn.on-green{background:rgba(52,211,153,.16);border-color:var(--green);color:var(--green)}
+.tri-btn.on-amber{background:rgba(251,191,36,.16);border-color:var(--amber);color:var(--amber)}
+.tri-btn.on-red{background:rgba(248,113,113,.16);border-color:var(--red);color:var(--red)}
+
+/* ---------- markdown ---------- */
+.md{line-height:2}
+.md h1{font-size:1.3rem;border-bottom:1px solid var(--border);padding-bottom:8px}
+.md h2{font-size:1.12rem;color:var(--accent);margin-top:26px}
+.md h3{font-size:1rem;color:var(--purple)}
+.md h4{font-size:.92rem}
+.md code{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:1px 6px;font-size:.78em}
+.md pre{background:#070b12;border:1px solid var(--border);border-radius:10px;padding:12px;overflow-x:auto}
+.md table{border-collapse:collapse;max-width:100%;display:block;overflow-x:auto}
+.md th,.md td{border:1px solid var(--border);padding:6px 12px;font-size:.82rem}
+.md th{background:var(--panel2)}
+.md blockquote{border-inline-start:3px solid var(--accent);margin:0;padding:4px 14px;color:var(--muted);background:rgba(56,189,248,.05);border-radius:6px}
+.md ul,.md ol{padding-inline-start:22px}
+
+/* ---------- misc ---------- */
+.bigbanner{background:linear-gradient(135deg,rgba(56,189,248,.12),rgba(167,139,250,.1));
+  border:1px solid rgba(56,189,248,.3);border-radius:14px;padding:16px 18px;margin-block:14px}
+.bigbanner .t{font-weight:800;font-size:1.02rem;margin-bottom:4px}
+.bigbanner .s{color:var(--muted);font-size:.8rem}
+.bigbanner b{font-family:var(--mono);color:var(--accent)}
+#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:80;
+  background:#0a1019;border:1px solid var(--accent);color:var(--text);border-radius:12px;
+  padding:10px 22px;font-size:.84rem;opacity:0;pointer-events:none;transition:.25s}
+#toast.show{opacity:1;bottom:28px}
+body.dragging::after{
+  content:'📁 Drop files here';position:fixed;inset:8px;z-index:90;
+  border:2px dashed var(--accent);border-radius:18px;background:rgba(11,15,23,.85);
+  display:flex;align-items:center;justify-content:center;font-size:1.1rem;font-weight:700;color:var(--accent);
+}
+.empty{padding:44px 20px;text-align:center;color:var(--muted)}
+.empty .e-ico{font-size:2.4rem;display:block;margin-bottom:10px;opacity:.7}
+details.raw{margin-top:6px}
+details.raw summary{cursor:pointer;color:var(--muted);font-size:.76rem}
+.help-steps{counter-reset:st;list-style:none;padding:0}
+.help-steps li{counter-increment:st;position:relative;padding:10px 12px 10px 44px;margin-bottom:10px;
+  background:var(--panel2);border:1px solid var(--border);border-radius:12px;font-size:.86rem}
+.help-steps li::before{content:counter(st);position:absolute;left:10px;top:50%;transform:translateY(-50%);
+  width:24px;height:24px;border-radius:50%;background:var(--accent);color:#04121d;font-weight:800;
+  display:flex;align-items:center;justify-content:center;font-size:.8rem}
+.warnbox{border:1px solid rgba(251,191,36,.4);background:rgba(251,191,36,.07);border-radius:12px;padding:12px 16px;font-size:.83rem;color:var(--amber)}
+</style>
+</head>
+<body>
+<header class="app">
+  <div class="wrap">
+    <div class="head">
+      <div class="brand"><span class="shield">🛡️</span> XSScanner <span style="color:var(--accent)">Results Viewer</span></div>
+      <div class="headstats" id="headStats"></div>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="summary">📊 Summary</button>
+      <button class="tab" data-tab="findings">🎯 Findings</button>
+      <button class="tab" data-tab="params">🔍 Params</button>
+      <button class="tab" data-tab="audit">🧹 Cleanup Audit</button>
+      <button class="tab" data-tab="log">📜 Run Log</button>
+      <button class="tab" data-tab="report">📄 MD Report</button>
+      <button class="tab" data-tab="help">❓ Help</button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+<!-- ============ TAB: SUMMARY ============ -->
+<section class="tabpane active" id="pane-summary">
+  <div class="toolbar">
+    <button class="btn primary" id="btnLoadAuto">🔄 Auto-load from results/</button>
+    <input type="file" id="fileFindings" accept=".jsonl,.json,.txt" hidden>
+    <button class="btn" id="btnPickFindings">📂 Load raw_findings.jsonl</button>
+    <input type="file" id="fileAudit" accept=".jsonl,.json,.txt" hidden>
+    <button class="btn" id="btnPickAudit">🧹 Load cleanup_audit.jsonl</button>
+    <input type="file" id="fileReport" accept=".md,.txt" hidden>
+    <button class="btn" id="btnPickReport">📄 Load TARGET_REPORT.md</button>
+    <div class="spacer"></div>
+    <button class="btn icon" id="btnReset" title="Clear all loaded data">🗑️</button>
+    <div class="chips" id="loadStatus"></div>
+  </div>
+
+  <div id="setupHint" class="bigbanner" style="display:none">
+    <div class="t">👋 Welcome — no data loaded yet</div>
+    <div class="s">Click "Auto-load" (works when the viewer is served next to the <b>results/</b> folder), or load the tool's output files with the buttons above or by dragging &amp; dropping them onto the page. Full instructions are in the Help tab.</div>
+  </div>
+
+  <div id="dupBanner"></div>
+
+  <div class="cards" id="kpiCards"></div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h3><span class="ico">🌐</span> Findings by host</h3>
+      <p class="sub">Unique findings (after chunk dedup) per target host</p>
+      <div id="chartHosts"></div>
+    </div>
+    <div class="panel">
+      <h3><span class="ico">⚖️</span> Severity distribution</h3>
+      <p class="sub">The severity/confidence label the tool put on each finding</p>
+      <div class="donutwrap" id="chartSeverity"></div>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h3><span class="ico">🧪</span> Evidence type</h3>
+      <p class="sub">What kind of evidence backs each finding? A "reflection" without a real payload usually means a false positive</p>
+      <div class="donutwrap" id="chartEvidence"></div>
+    </div>
+    <div class="panel">
+      <h3><span class="ico">🚨</span> Most frequent parameters (finding pattern)</h3>
+      <p class="sub">A single parameter found across many paths/hosts — usually shared app behavior, not an independent bug</p>
+      <div id="chartParams"></div>
+    </div>
+  </div>
+
+  <div class="panel" id="cspPanel" style="display:none">
+    <h3><span class="ico">🧱</span> Findings with CSP restrictions</h3>
+    <p class="sub">These reflect, but the tool detected a strict CSP on the page; inline execution is probably blocked — test manually before reporting</p>
+    <div id="cspList"></div>
+  </div>
+
+  <div class="panel">
+    <h3><span class="ico">🧾</span> Cleanup audit statistics (cleanup_audit)</h3>
+    <p class="sub" id="auditSub">Events recorded in the audit file; see the Cleanup Audit tab for details</p>
+    <div id="auditSummary"></div>
+  </div>
+</section>
+
+<!-- ============ TAB: FINDINGS ============ -->
+<section class="tabpane" id="pane-findings">
+  <div class="toolbar">
+    <div class="filters" style="width:100%">
+      <input id="fSearch" type="search" placeholder="Search URL / parameter / payload...">
+      <select id="fSeverity">
+        <option value="">Severity: all</option>
+        <option value="high">High (high/confirmed)</option>
+        <option value="medium">Medium (likely)</option>
+        <option value="low">Low (low)</option>
+        <option value="info">Info</option>
+      </select>
+      <select id="fEvidence">
+        <option value="">Evidence: all</option>
+        <option value="payload">Real payload</option>
+        <option value="canary">Canary/marker only</option>
+        <option value="snippet">Reflected snippet</option>
+        <option value="csp">Has CSP</option>
+        <option value="none">No clear evidence</option>
+      </select>
+      <select id="fTriage">
+        <option value="">Triage: all</option>
+        <option value="confirmed">✅ Confirmed</option>
+        <option value="suspect">🤔 Suspect</option>
+        <option value="fp">❌ False positive</option>
+        <option value="none">Untriaged</option>
+      </select>
+      <select id="fHost"><option value="">Host: all</option></select>
+    </div>
+    <label class="chip" style="cursor:pointer"><input type="checkbox" id="fHideFp" style="width:auto"> Hide false positives</label>
+    <label class="chip" style="cursor:pointer"><input type="checkbox" id="fGroupParam" style="width:auto"> Group by parameter</label>
+    <div class="spacer"></div>
+    <button class="btn small" id="btnExportCsv">⬇️ Export CSV</button>
+    <button class="btn small" id="btnExportJson">⬇️ Export JSON</button>
+    <button class="btn small" id="btnImportTriage">📥 Import triage</button>
+    <input type="file" id="fileTriage" accept=".json" hidden>
+  </div>
+  <div class="chips" id="findChips"></div>
+  <div class="tblwrap">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>#</th><th>Severity</th><th>Host / Path</th><th>Parameter</th>
+          <th class="hide-sm">Evidence</th><th class="hide-sm">Chunk</th><th>Triage</th>
+        </tr>
+      </thead>
+      <tbody id="findRows"></tbody>
+    </table>
+  </div>
+  <p class="hint" style="margin-top:10px">💡 Click any row to open full details, payloads, a curl test command and the triage buttons (confirmed / suspect / false positive). Your decisions are stored in the browser.</p>
+</section>
+
+<!-- ============ TAB: PARAMS ============ -->
+<section class="tabpane" id="pane-params">
+  <div class="toolbar">
+    <input id="pSearch" type="search" placeholder="Search parameter name..." style="max-width:340px">
+    <div class="spacer"></div>
+    <span class="hint" id="paramsMeta"></span>
+  </div>
+  <div class="cards" id="paramKpis"></div>
+  <div class="panel">
+    <h3><span class="ico">📋</span> All parameters seen in findings</h3>
+    <p class="sub">How many paths each parameter was found on + overall status; noisy parameters (utm_, _, callback, …) are usually a false-positive source</p>
+    <div class="tblwrap">
+      <table class="tbl">
+        <thead><tr><th>Parameter</th><th>Path count</th><th class="hide-sm">Sample URL</th><th>FP likelihood</th></tr></thead>
+        <tbody id="paramRows"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="panel" id="cappedPanel" style="display:none">
+    <h3><span class="ico">⛔</span> Hosts that hit the 200-parameter cap</h3>
+    <p class="sub">"Max params reached" events from the audit; some discovered parameters were not added to the file, so something may be missing</p>
+    <div id="cappedList"></div>
+  </div>
+</section>
+
+<!-- ============ TAB: AUDIT ============ -->
+<section class="tabpane" id="pane-audit">
+  <div class="toolbar">
+    <select id="aType"><option value="">Event type: all</option></select>
+    <input id="aSearch" type="search" placeholder="Search details...">
+    <div class="spacer"></div>
+    <span class="hint" id="auditMeta"></span>
+  </div>
+  <div class="chips" id="auditChips"></div>
+  <div class="tblwrap">
+    <table class="tbl">
+      <thead><tr><th>Time</th><th>Type</th><th class="hide-sm">Target/Host</th><th>Details</th></tr></thead>
+      <tbody id="auditRows"></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ TAB: LOG ============ -->
+<section class="tabpane" id="pane-log">
+  <div class="toolbar">
+    <input type="file" id="fileLog" accept=".txt,.log" hidden>
+    <button class="btn primary" id="btnPickLog">📂 Load run log file</button>
+    <button class="btn" id="btnParsePaste">Analyze pasted text</button>
+    <div class="spacer"></div>
+    <button class="btn small danger" id="btnClearLog">Clear log</button>
+  </div>
+  <div class="grid2">
+    <div>
+      <div class="panel">
+        <h3><span class="ico">📥</span> Paste the log text here</h3>
+        <textarea id="logPaste" placeholder="Paste the tool's terminal output here (including [VULN FOUND] blocks and [BRIDGE] lines...)"></textarea>
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn primary small" id="btnParsePaste2">🧮 Analyze</button>
+          <button class="btn small" id="btnImportLogVulns">➕ Add log findings to the Findings tab</button>
+        </div>
+      </div>
+      <div class="panel" id="logSummaryPanel" style="display:none">
+        <h3><span class="ico">🧮</span> Summary extracted from the log</h3>
+        <div id="logSummary"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3><span class="ico">🎯</span> VULN FOUND blocks in the log</h3>
+      <p class="sub">Each block is one finding; the same URL+param repeating in later chunks is normal (each chunk re-confirms it)</p>
+      <div id="logVulns"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ TAB: REPORT ============ -->
+<section class="tabpane" id="pane-report">
+  <div class="toolbar">
+    <button class="btn" id="btnReloadReport">🔄 Load TARGET_REPORT.md from results/</button>
+    <div class="spacer"></div>
+    <label class="chip" style="cursor:pointer"><input type="checkbox" id="mdRaw" style="width:auto"> Raw view (Markdown)</label>
+  </div>
+  <div id="reportEmpty" class="empty" style="display:none"><span class="e-ico">📄</span>TARGET_REPORT.md not loaded — click the button above or drag &amp; drop the file</div>
+  <div class="panel"><div class="md" id="mdRender"></div></div>
+  <div class="panel" style="display:none"><pre class="code" id="mdRawView"></pre></div>
+</section>
+
+<!-- ============ TAB: HELP ============ -->
+<section class="tabpane" id="pane-help">
+  <div class="grid2">
+    <div class="panel">
+      <h3><span class="ico">🖥️</span> Serving on a server and opening it in the browser</h3>
+      <p class="sub">Three ways; the first one is the simplest</p>
+      <ol class="help-steps">
+        <li><b>Serve the results folder</b> — on the server:<br><pre class="code" style="margin-top:8px">cd ~/tools/xsscanner/results
+python3 -m http.server 8877 --bind 127.0.0.1</pre></li>
+        <li><b>Copy the viewer into results</b> — put <code>xsscanner-viewer.html</code> in that folder:<br><pre class="code" style="margin-top:8px">cp xsscanner-viewer.html ~/tools/xsscanner/results/
+# then open in your browser:  http://SERVER_IP:8877/xsscanner-viewer.html</pre></li>
+        <li><b>SSH tunnel</b> (if the port is not reachable):<br><pre class="code" style="margin-top:8px">ssh -L 8877:127.0.0.1:8877 root@hunt-server
+# then open in your local browser:  http://localhost:8877/xsscanner-viewer.html</pre></li>
+      </ol>
+      <div class="warnbox" style="margin-top:8px">⚠️ Scan results contain sensitive URLs; bind the server to <b>127.0.0.1</b> only and do not expose it to the outside, or use an SSH tunnel.</div>
+    </div>
+    <div class="panel">
+      <h3><span class="ico">📂</span> Files the viewer reads</h3>
+      <table class="tbl" style="min-width:0">
+        <thead><tr><th>File</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="ltr">results/raw_findings.jsonl</td><td>The tool's raw findings — one JSON per line. The main source for the Findings tab</td></tr>
+          <tr><td class="ltr">results/cleanup_audit.jsonl</td><td>Audit events (parameter caps, dedup, …) — Cleanup Audit tab</td></tr>
+          <tr><td class="ltr">results/TARGET_REPORT.md</td><td>The final text report — MD Report tab</td></tr>
+          <tr><td class="ltr">Terminal output (log)</td><td>Run log text — Run Log tab; VULN FOUND blocks are extracted and can be added as findings</td></tr>
+        </tbody>
+      </table>
+      <p class="sub" style="margin-top:12px">You can also load all of these by dragging &amp; dropping them onto the page; the viewer uses the file name to decide where each file goes. No data ever leaves your browser — everything is processed offline inside the page.</p>
+    </div>
+  </div>
+  <div class="panel">
+    <h3><span class="ico">🧭</span> How do I spot false positives?</h3>
+    <p class="sub">A suggested triage framework for sorting 250 raw findings</p>
+    <table class="tbl" style="min-width:0">
+      <thead><tr><th>Sign</th><th>Meaning</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr><td><span class="b b-green">Real payload</span> + snippet/execution</td><td>A genuinely malicious payload (not just a canary) is reflected, ideally with DOM/execution evidence</td><td>Confirm → report</td></tr>
+        <tr><td><span class="b b-amber">Canary only</span> (x9canary)</td><td>The parameter is reflected, but the payload was only a discovery marker; not proof of execution</td><td>Test manually: send a real payload</td></tr>
+        <tr><td><span class="b b-purple">CSP</span> in the tool's note</td><td>Reflection exists, but a strict CSP probably blocks execution</td><td>Check the reflection context; XSS is only valid in the right context</td></tr>
+        <tr><td><span class="b b-gray">Noisy parameters</span> (_, callback, utm_*, token…)</td><td>Standard app behavior (JSONP, analytics, anti-CSRF) — not a vulnerability</td><td>False positive → drop from the report</td></tr>
+        <tr><td><span class="b b-blue">Chunk repetition</span> (chunk 3/3)</td><td>The same earlier finding re-confirmed in a later chunk — the viewer dedupes it automatically</td><td>No action needed</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</main>
+
+<!-- ============ MODAL ============ -->
+<div class="modal" id="modal">
+  <div class="box">
+    <div class="mhead">
+      <h3 id="mTitle">Finding details</h3>
+      <button class="btn small" id="mCopyJson">📋 Copy JSON</button>
+      <button class="btn small danger" id="mClose">✕</button>
+    </div>
+    <div class="mbody" id="mBody"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+
+
+/* ======== CORE ======== */
+'use strict';
+/* ============================================================
+   XSScanner Results Viewer — core (state, parsing, loading)
+   All processing is offline and inside the browser; no data is sent anywhere.
+   ============================================================ */
+
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = n => Number(n || 0).toLocaleString('en-US');
+
+function toast(msg, ms) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), ms || 2600);
+}
+
+/* ---------------- state ---------------- */
+const S = {
+  findings: [],        // unique (normalized) findings
+  rawCount: 0,         // total raw records
+  dupDropped: 0,
+  audit: [],
+  reportMd: null,
+  logText: null,
+  triage: {},          // key -> {status:'confirmed'|'suspect'|'fp', note, ts}
+};
+const LS_KEY = 'xsscanner-triage-v1';
+function loadTriage(){ try { S.triage = JSON.parse(localStorage.getItem(LS_KEY) || '{}') || {}; } catch(e){ S.triage = {}; } }
+function saveTriage(){ try { localStorage.setItem(LS_KEY, JSON.stringify(S.triage)); } catch(e){} }
+
+/* ---------------- generic helpers ---------------- */
+function pick(o, keys){ for (const k of keys){ if (o && o[k] !== undefined && o[k] !== null && o[k] !== '') return o[k]; } return undefined; }
+
+function parseJSONL(text){
+  const out = [];
+  for (const line of String(text).split(/\r?\n/)){
+    const t = line.trim(); if (!t) continue;
+    try { out.push({ok:true, obj: JSON.parse(t)}); }
+    catch(e){ out.push({ok:false, line:t}); }
+  }
+  return out;
+}
+
+function splitUrl(u){
+  const raw = String(u || '');
+  try {
+    const x = new URL(raw);
+    return {host:x.host, path:x.pathname, search:x.search, base: x.origin + x.pathname};
+  } catch(e){
+    const m = raw.match(/^[a-z]+:\/\/([^/?#]+)([^?#]*)/i);
+    if (m) return {host:m[1], path:m[2]||'/', search:'', base: raw.split('?')[0]};
+    return {host: raw.split('/')[0] || raw, path:'/'+raw.split('/').slice(1).join('?')[0], search:'', base: raw.split('?')[0]};
+  }
+}
+
+/* Parameters that are usually false-positive sources (analytics, anti-CSRF, pagination, …) */
+const FP_PARAM_RE = /^(_|utm_\w+|fbclid|gclid|msclkid|mc_eid|mc_cid|gbraid|wbraid|ref|referrer|referer|token|csrf\w*|_token|authenticity_token|xsrf\w*|nonce|_sid|sid$|session\w*|lang|locale|page|p$|per_page|limit|offset|sort|order|dir$|tab|view$|format|debug|preview|theme|width|height|ver|v$|t$|cache|_=$|android|ios|amp$)/i;
+const JSONP_RE = /^(callback|cb$|jsonp|cb_func|_callback)$/i;
+
+/* ---------------- normalize a raw finding ---------------- */
+function gatherPayloads(f){
+  const set = [];
+  const push = v => {
+    if (!v) return;
+    if (Array.isArray(v)) { v.forEach(push); return; }
+    if (typeof v === 'object'){ Object.values(v).forEach(push); return; }
+    const s = String(v).trim();
+    if (!s) return;
+    // "Payloads: single: x, double: y" → split into items
+    s.split(/\s*,\s*(?=(?:single|double|triple|payload|raw)\s*:)/i).forEach(part=>{
+      const p = part.replace(/^\s*(single|double|triple|payload|raw)\s*:\s*/i,'').trim();
+      if (p && !set.includes(p) && set.length < 24) set.push(p);
+    });
+  };
+  push(pick(f, ['payloads','payload','Payloads','Payload']));
+  const ev = f.evidence || f.proof || f.details;
+  if (ev && typeof ev === 'object') push(pick(ev, ['payloads','payload']));
+  return set;
+}
+
+function classifyEvidence(f, note){
+  const payloads = gatherPayloads(f);
+  const rawTxt = JSON.stringify(f);
+  const snippet = pick(f, ['snippet','context','reflection','reflected','evidence_snippet','match']) || '';
+  const isCanary = p => /^x9/i.test(decodeURIComponentSafe(p).trim());
+  const real = payloads.filter(p => /[<%3c]\/?(script|svg|img|test|body)|onerror|onload|javascript:|<%3c/i.test(p) && !isCanary(p));
+  const csp = /csp|content[- ]security/i.test((note || '') + ' ' + rawTxt);
+  let type = 'none';
+  if (real.length) type = 'payload';
+  else if (payloads.length) type = 'canary';
+  else if (snippet) type = 'snippet';
+  return { type, csp, payloads, snippet: String(snippet).slice(0, 600) };
+}
+function decodeURIComponentSafe(s){ try { return decodeURIComponent(s); } catch(e){ return s; } }
+
+function severityOf(f, note){
+  const v = String(pick(f, ['severity','confidence','level','likelihood','rank','severity_level']) || '').toLowerCase();
+  const bracket = (note || '').match(/\[(\w+)\]/);
+  const src = (v || (bracket ? bracket[1] : '')).toLowerCase();
+  if (/confirm|critical|high|certain|definite/.test(src)) return 'high';
+  if (/likely|medium|probable/.test(src)) return 'medium';
+  if (/low|possible|maybe/.test(src)) return 'low';
+  if (/info|note|unknown/.test(src)) return 'info';
+  return 'medium';
+}
+
+function normalizeFinding(obj, source, meta){
+  const f = obj || {};
+  const url = pick(f, ['url','URL','Url','target','uri','endpoint','vuln_url','request_url','location'])
+           || (f.request && (f.request.url || f.request.target))
+           || pick(f, ['path','Path']) || '';
+  const u = splitUrl(url);
+  let param = pick(f, ['param','parameter','name','param_name','parameter_name']);
+  let extraParams = 0;
+  if (!param && Array.isArray(f.params)) { param = f.params[0]; extraParams = f.params.length - 1; }
+  if (!param && f.parameters) { const p = Array.isArray(f.parameters) ? f.parameters[0] : String(f.parameters).split(',')[0]; param = p; }
+  const method = String(pick(f, ['method','http_method','verb']) || (f.request && f.request.method) || 'GET').toUpperCase();
+  const note = String(pick(f, ['note','notes','description','detail','comment','remark','Note']) || '');
+  const ev = classifyEvidence(f, note);
+  const sev = severityOf(f, note);
+  const chunk = pick(f, ['chunk','chunk_index','chunk_id']) ?? (meta && meta.chunk) ?? '';
+  const key = (u.host + '|' + u.path + '|' + method + '|' + String(param||'').toLowerCase());
+  return {
+    key, url: String(url), host: u.host, path: u.path, method,
+    param: String(param || '—'), extraParams,
+    severity: sev, note, evidence: ev.type, csp: ev.csp,
+    payloads: ev.payloads, snippet: ev.snippet,
+    sources: [source], chunks: chunk !== '' ? [String(chunk)] : [],
+    dupCount: 1, raw: f,
+  };
+}
+
+/* Add/merge findings by unique key */
+function addFindings(list, source, meta){
+  let added = 0, merged = 0;
+  const idx = new Map(S.findings.map((f,i)=>[f.key,i]));
+  for (const obj of list){
+    const n = normalizeFinding(obj, source, meta);
+    if (n.param === '—' && !n.url) continue;
+    S.rawCount++;
+    if (idx.has(n.key)){
+      const t = S.findings[idx.get(n.key)];
+      t.dupCount++; merged++;
+      if (n.chunks[0] && !t.chunks.includes(n.chunks[0])) t.chunks.push(n.chunks[0]);
+      if (!t.sources.includes(source)) t.sources.push(source);
+      for (const p of n.payloads) if (!t.payloads.includes(p) && t.payloads.length < 24) t.payloads.push(p);
+      if (n.snippet && !t.snippet) t.snippet = n.snippet;
+      if (n.evidence === 'payload') t.evidence = 'payload';
+      if (n.csp) t.csp = true;
+    } else {
+      idx.set(n.key, S.findings.length);
+      S.findings.push(n); added++;
+    }
+  }
+  S.dupDropped = S.rawCount - S.findings.length;
+  return {added, merged};
+}
+
+/* ---------------- audit ---------------- */
+function normalizeAudit(obj, line){
+  const o = obj || {};
+  const type = String(pick(o, ['type','event','action','event_type','kind']) || 'unknown');
+  const target = String(pick(o, ['target','host','url','domain','target_host','scope']) || '');
+  const ts = pick(o, ['ts','timestamp','time','date','at']) || '';
+  const parts = [];
+  for (const k of ['detail','message','reason','note','info','count','dropped','from','to','limit']){
+    if (o[k] !== undefined && o[k] !== null && o[k] !== '') parts.push(k + '=' + o[k]);
+  }
+  return { ts:String(ts), type, target, detail: parts.join(' · ') || (line||'').slice(0,200), raw:o, rawLine: line||'' };
+}
+
+/* ---------------- log parsing ---------------- */
+function parseLog(text){
+  const L = String(text);
+  const vulns = [];
+  const stats = {
+    firstTs:null, lastTs:null, tests:0, fresh:0, reuse:0, timeouts:0,
+    vulnBlocks:0, reflections:0, probedUrls:0, targets:new Set(),
+    collapseLines:[], maxPathsLines:[], scopeOrder:{},
+  };
+  // chunk tracking: order of first sighting of each scope-hash → chunk number
+  let curUrl = '', curScope = '';
+  const lines = L.split(/\r?\n/);
+  const tsRe = /^\[(\d{2}:\d{2}:\d{2})\]/;
+  for (let i = 0; i < lines.length; i++){
+    const ln = lines[i];
+    const ts = ln.match(tsRe);
+    if (ts){ if (!stats.firstTs) stats.firstTs = ts[1]; stats.lastTs = ts[1]; }
+    let m;
+    if ((m = ln.match(/\[TEST\] xssniper → (\S+) \(([^)]*)\)/))){
+      stats.tests++;
+      curUrl = m[1];
+      const sc = (m[2].match(/scope:\s*(\S+?)[,)]/)||[])[1] || '';
+      curScope = sc;
+      if (sc && stats.scopeOrder[sc] === undefined) stats.scopeOrder[sc] = Object.keys(stats.scopeOrder).length + 1;
+      if (/probe: fresh/.test(m[2])) stats.fresh++; else if (/probe: reuse/.test(m[2])) stats.reuse++;
+    }
+    if ((m = ln.match(/\[TARGET\] \[\d+\/\d+[^\]]*\] (\S+)/))) stats.targets.add(m[1]);
+    if (/timed out after/.test(ln)) stats.timeouts++;
+    if ((m = ln.match(/(\d+) URLs probed -> (\d+) reflections? found/))){ stats.probedUrls += +m[1]; stats.reflections += +m[2]; }
+    if (/structural collapse|uro semantic dedup/.test(ln)) stats.collapseLines.push(ln.replace(/^\[[^\]]*\]\s*/,''));
+    if (/MAX-PATHS/.test(ln)) stats.maxPathsLines.push(ln.replace(/^\[[^\]]*\]\s*/,''));
+    // VULN FOUND blocks
+    if (/VULN FOUND\]/.test(ln)){
+      stats.vulnBlocks++;
+      // the block's URL = the next line
+      const vUrl = (lines[i+1]||'').trim();
+      // until the end of the block (next empty line)
+      let j = i + 2, block = [];
+      while (j < lines.length && lines[j].trim() !== '' && !/VULN FOUND/.test(lines[j])){ block.push(lines[j]); j++; }
+      const blockTxt = block.join('\n');
+      const payloads = (blockTxt.match(/Payloads:\s*(.+)/)||[])[1] || '';
+      const pmRe = /^\s*-\s+([^\s:]+)(?:\s*\(Note:\s*([^)]*)\))?\s*:\s*\[([^\]]*)\]/gm;
+      let pm;
+      while ((pm = pmRe.exec(blockTxt))){
+        vulns.push({
+          url: vUrl, param: pm[1], note: pm[2]||'', confidence: pm[3]||'',
+          payloads: payloads, chunk: stats.scopeOrder[curScope] || '',
+          host: splitUrl(vUrl).host, path: splitUrl(vUrl).path,
+        });
+      }
+    }
+  }
+  // dedupe by url+param
+  const seen = new Map();
+  for (const v of vulns){
+    const k = v.host + '|' + v.path + '|' + v.param;
+    if (!seen.has(k)) seen.set(k, {...v, count:1});
+    else seen.get(k).count++;
+  }
+  return {stats, vulns, uniqueVulns: Array.from(seen.values())};
+}
+
+/* ---------------- markdown (mini renderer) ---------------- */
+/* Only these link schemes are rendered as links; anything else (javascript:, data:, …) is shown as plain text */
+function safeHref(h){
+  try {
+    const p = new URL(h).protocol;
+    return p === 'http:' || p === 'https:' || p === 'mailto:';
+  } catch(e){ return false; }
+}
+function mdToHtml(src){
+  const lines = String(src||'').replace(/\r\n/g,'\n').split('\n');
+  let html = [], i = 0, inCode = false, codeBuf = [], listMode = null;
+  const inline = t => esc(t)
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>')
+    .replace(/(^|[^*])\*([^*\n]+)\*/g,'$1<i>$2</i>')
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, txt, href) =>
+      safeHref(href) ? '<a href="'+href+'" target="_blank" rel="noopener">'+txt+'</a>' : txt);
+  const closeList = () => { if (listMode){ html.push(listMode==='ul'?'</ul>':'</ol>'); listMode=null; } };
+  while (i < lines.length){
+    const ln = lines[i];
+    if (/^```/.test(ln)){ 
+      if (!inCode){ closeList(); inCode=true; codeBuf=[]; }
+      else { inCode=false; html.push('<pre class="code">'+esc(codeBuf.join('\n'))+'</pre>'); }
+      i++; continue;
+    }
+    if (inCode){ codeBuf.push(ln); i++; continue; }
+    const h = ln.match(/^(#{1,6})\s+(.*)/);
+    if (h){ closeList(); html.push('<h'+h[1].length+'>'+inline(h[2])+'</h'+h[1].length+'>'); i++; continue; }
+    if (/^\s*(---|\*\*\*)\s*$/.test(ln)){ closeList(); html.push('<hr>'); i++; continue; }
+    if (/^\s*>\s?/.test(ln)){ closeList(); html.push('<blockquote>'+inline(ln.replace(/^\s*>\s?/,''))+'</blockquote>'); i++; continue; }
+    // table
+    if (/\|/.test(ln) && i+1 < lines.length && /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(lines[i+1])){
+      closeList();
+      const head = ln.split('|').map(s=>s.trim()).filter((s,x,a)=>!(x===0&&!s)&&!(x===a.length-1&&!s));
+      html.push('<table><thead><tr>'+head.map(s=>'<th>'+inline(s)+'</th>').join('')+'</tr></thead><tbody>');
+      i += 2;
+      while (i < lines.length && /\|/.test(lines[i])){
+        const cells = lines[i].split('|').map(s=>s.trim()).filter((s,x,a)=>!(x===0&&!s)&&!(x===a.length-1&&!s));
+        html.push('<tr>'+cells.map(s=>'<td>'+inline(s)+'</td>').join('')+'</tr>');
+        i++;
+      }
+      html.push('</tbody></table>'); continue;
+    }
+    const ul = ln.match(/^\s*[-*]\s+(.*)/), ol = ln.match(/^\s*\d+[.)]\s+(.*)/);
+    if (ul || ol){
+      const want = ul ? 'ul' : 'ol';
+      if (listMode !== want){ closeList(); html.push('<'+want+'>'); listMode = want; }
+      html.push('<li>'+inline((ul||ol)[1])+'</li>'); i++; continue;
+    }
+    if (!ln.trim()){ closeList(); i++; continue; }
+    closeList(); html.push('<p>'+inline(ln)+'</p>'); i++;
+  }
+  closeList(); if (inCode) html.push('<pre class="code">'+esc(codeBuf.join('\n'))+'</pre>');
+  return html.join('\n');
+}
+
+/* ---------------- loading: fetch / files / drop ---------------- */
+const FETCH_BASES = ['', 'results/', './results/'];
+
+async function tryFetch(name){
+  for (const b of FETCH_BASES){
+    try {
+      const r = await fetch(b + name, {cache:'no-store'});
+      if (r.ok){ const t = await r.text(); if (t.trim()) return {text:t, path:b+name}; }
+    } catch(e){}
+  }
+  return null;
+}
+
+function routeLoaded(kind, text, label){
+  if (kind === 'findings'){
+    const recs = parseJSONL(text);
+    const objs = recs.filter(r=>r.ok).map(r=>r.obj);
+    if (!objs.length && !recs.length){ statusChip('findings', 'Format not recognized', 'err'); return; }
+    const {added, merged} = addFindings(objs, label);
+    statusChip('findings', 'raw_findings: '+fmt(objs.length)+' records → '+fmt(added)+' unique'+(merged?' ('+fmt(merged)+' merged)':''), 'ok');
+  } else if (kind === 'audit'){
+    const recs = parseJSONL(text);
+    S.audit = recs.map(r => normalizeAudit(r.ok ? r.obj : null, r.line));
+    statusChip('audit', 'cleanup_audit: '+fmt(S.audit.length)+' events', 'ok');
+  } else if (kind === 'report'){
+    S.reportMd = text;
+    statusChip('report', 'TARGET_REPORT: '+fmt(text.length)+' characters', 'ok');
+  } else if (kind === 'log'){
+    S.logText = text;
+    statusChip('log', 'log: '+fmt(text.split('\n').length)+' lines', 'ok');
+    parseAndRenderLog();
+  }
+  renderAll();
+}
+
+function guessKind(name, text){
+  const n = String(name||'').toLowerCase();
+  if (/finding/.test(n)) return 'findings';
+  if (/audit|cleanup/.test(n)) return 'audit';
+  if (/report/.test(n) || /\.md$/.test(n)) return 'report';
+  if (/\.(log|txt)$/.test(n) || /VULN FOUND|\[BRIDGE\]|\[TEST\]/.test(text.slice(0,4000))) return 'log';
+  if (/^\s*[{\[]/.test(text)) return 'findings';
+  if (text.includes('#') && !text.includes('{')) return 'report';
+  return 'findings';
+}
+
+function statusChip(kind, msg, cls){
+  const box = $('#loadStatus');
+  let chip = box.querySelector('[data-k="'+kind+'"]');
+  if (!chip){ chip = document.createElement('span'); chip.dataset.k = kind; box.appendChild(chip); }
+  chip.className = 'chip ' + (cls||'');
+  chip.textContent = (cls==='err'?'⚠️ ':'✔️ ') + msg;
+}
+
+async function autoLoad(){
+  toast('Trying auto-load…');
+  const plan = [['raw_findings.jsonl','findings'],['cleanup_audit.jsonl','audit'],['TARGET_REPORT.md','report']];
+  let any = false;
+  await Promise.all(plan.map(async ([name,kind])=>{
+    const r = await tryFetch(name);
+    if (r){ any = true; routeLoaded(kind, r.text, name); }
+    else statusChip(kind, name+' not found', 'err');
+  }));
+  if (!any){
+    if (location.protocol === 'file:')
+      toast('⚠️ Page opened via file:// — fetch does not work; use http.server or the file-load buttons', 5000);
+    else
+      toast('⚠️ No files found — the viewer must be served next to or inside the results folder', 4500);
+  } else {
+    toast('✅ Auto-load complete');
+  }
+  renderAll();
+}
+
+
+/* ======== RENDER ======== */
+'use strict';
+/* ============================================================
+   XSScanner Results Viewer — rendering & interactions
+   ============================================================ */
+
+/* ---------------- severity / evidence maps ---------------- */
+const SEV_LABEL = {high:'High', medium:'Medium', low:'Low', info:'Info'};
+const SEV_BADGE = {high:'b-red', medium:'b-amber', low:'b-blue', info:'b-gray'};
+const EV_LABEL  = {payload:'Real payload', canary:'Canary only', snippet:'Reflected snippet', none:'Unclear'};
+const EV_BADGE  = {payload:'b-green', canary:'b-amber', snippet:'b-blue', none:'b-gray'};
+const TRI_LABEL = {confirmed:'✅ Confirmed', suspect:'🤔 Suspect', fp:'❌ False positive'};
+const TRI_CLASS = {confirmed:'on-green', suspect:'on-amber', fp:'on-red'};
+
+/* Unknown values fall back to 'info'/'none' instead of rendering "undefined" */
+const sevLabel = s => SEV_LABEL[s] || SEV_LABEL.info;
+const sevBadge = s => SEV_BADGE[s] || 'b-gray';
+const evLabel  = e => EV_LABEL[e] || EV_LABEL.none;
+const evBadge  = e => EV_BADGE[e] || 'b-gray';
+
+/* ---------------- render caps & debouncing ---------------- */
+const MAX_ROWS  = 500;   // findings table & log VULN blocks cap
+const PARAM_ROWS = 400;  // params table cap
+const AUDIT_ROWS = 800;  // audit table cap
+function debounce(fn, ms){
+  let h;
+  return function(...a){ clearTimeout(h); h = setTimeout(() => fn.apply(this, a), ms || 150); };
+}
+
+/* ---------------- clipboard helper (with execCommand fallback) ---------------- */
+function copyText(text){
+  const s = String(text ?? '');
+  const fallbackCopy = () => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = s;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed'; ta.style.top = '-1000px'; ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus(); ta.select(); ta.setSelectionRange(0, s.length);
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch(e){ return false; }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    return navigator.clipboard.writeText(s).then(() => true, () => fallbackCopy());
+  }
+  return Promise.resolve(fallbackCopy());
+}
+function copyToast(ok, what){
+  toast(ok ? '📋 ' + what + ' copied to clipboard' : '⚠️ Copy failed — copy the text manually', ok ? 2600 : 4000);
+}
+
+/* ---------------- tiny chart helpers ---------------- */
+function barChart(container, rows, opts){
+  // rows: [{label, value, cls}]
+  const o = opts || {};
+  const max = Math.max(1, ...rows.map(r=>r.value));
+  const top = o.top || rows.length;
+  const list = rows.slice().sort((a,b)=>b.value-a.value).slice(0, top);
+  if (!list.length){ container.innerHTML = '<div class="empty"><span class="e-ico">📭</span>No data</div>'; return; }
+  container.innerHTML = list.map(r => `
+    <div class="bar-row">
+      <div class="lbl" title="${esc(r.label)}">${esc(r.label)}</div>
+      <div class="track"><div class="fill ${r.cls||''}" style="width:${(r.value/max*100).toFixed(1)}%"></div></div>
+      <div class="num">${esc(fmt(r.value))}</div>
+    </div>`).join('');
+}
+
+function donut(container, items, centerLabel){
+  // items: [{label, value, color}]
+  const total = items.reduce((s,i)=>s+i.value,0);
+  if (!total){ container.innerHTML = '<div class="empty"><span class="e-ico">📭</span>No data</div>'; return; }
+  let acc = 0; const segs = [];
+  for (const it of items){
+    const pct = it.value/total*100;
+    segs.push(`${it.color} ${acc.toFixed(2)}% ${(acc+pct).toFixed(2)}%`); acc += pct;
+  }
+  const leg = items.map(it=>`
+    <div class="li"><span class="sw" style="background:${it.color}"></span>
+    <span style="min-width:110px">${esc(it.label)}</span>
+    <b style="font-family:var(--mono)">${esc(fmt(it.value))}</b>
+    <span class="hint">(${(it.value/total*100).toFixed(1)}%)</span></div>`).join('');
+  container.innerHTML = `
+    <div class="donut" style="background:conic-gradient(${segs.join(',')})">
+      <div class="cval"><b>${esc(fmt(total))}</b><span>${esc(centerLabel||'Total')}</span></div>
+    </div>
+    <div class="legend">${leg}</div>`;
+}
+
+/* ---------------- render: all ---------------- */
+function renderAll(){
+  renderHeadStats(); renderSummary(); renderFindings(); renderParams(); renderAudit(); renderReport();
+  $('#setupHint').style.display = (S.findings.length || S.audit.length || S.reportMd || S.logText) ? 'none' : 'block';
+}
+
+function renderHeadStats(){
+  $('#headStats').innerHTML = `
+    <span class="hstat">Unique findings: <b>${esc(fmt(S.findings.length))}</b></span>
+    <span class="hstat">Raw records: <b>${esc(fmt(S.rawCount))}</b></span>
+    <span class="hstat">Audit events: <b>${esc(fmt(S.audit.length))}</b></span>`;
+}
+
+function renderSummary(){
+  // KPI
+  const untriaged = S.findings.filter(f => !S.triage[f.key]).length;
+  const fps = S.findings.filter(f => S.triage[f.key]?.status === 'fp').length;
+  const confirmed = S.findings.filter(f => S.triage[f.key]?.status === 'confirmed').length;
+  const withPayload = S.findings.filter(f => f.evidence === 'payload').length;
+  const cspN = S.findings.filter(f => f.csp).length;
+  const hosts = new Set(S.findings.map(f=>f.host)).size;
+  const kpis = [
+    {l:'Unique findings', v:fmt(S.findings.length), d:`of ${fmt(S.rawCount)} raw records`, c:''},
+    {l:'With real payload', v:fmt(withPayload), d:'Main report candidates', c:'g'},
+    {l:'CSP-restricted', v:fmt(cspN), d:'Needs manual testing', c:'p'},
+    {l:'Confirmed', v:fmt(confirmed), d:'Your decision', c:'g'},
+    {l:'False positives', v:fmt(fps), d:'Your decision', c:'r'},
+    {l:'Untriaged', v:fmt(untriaged), d:'Next up in your queue', c:'a'},
+  ];
+  $('#kpiCards').innerHTML = kpis.map(k=>`
+    <div class="kpi ${k.c}"><div class="lbl">${esc(k.l)}</div><div class="v">${esc(k.v)}</div><div class="d">${esc(k.d)}</div></div>`).join('');
+
+  // dedup banner
+  if (S.rawCount > S.findings.length){
+    $('#dupBanner').innerHTML = `
+      <div class="bigbanner">
+        <div class="t">🧩 Dedup: ${esc(fmt(S.rawCount))} raw records → ${esc(fmt(S.findings.length))} unique findings</div>
+        <div class="s">${esc(fmt(S.dupDropped))} duplicate records merged (usually the same URL+param re-confirmed in a later chunk) — this number is normal and shows the "probe once per path" feature is working.</div>
+      </div>`;
+  } else { $('#dupBanner').innerHTML = ''; }
+
+  // charts
+  const byHost = {};
+  for (const f of S.findings) byHost[f.host] = (byHost[f.host]||0)+1;
+  barChart($('#chartHosts'), Object.entries(byHost).map(([h,v])=>({label:h, value:v})));
+
+  const sevCount = {high:0, medium:0, low:0, info:0};
+  for (const f of S.findings) sevCount[f.severity]++;
+  donut($('#chartSeverity'), [
+    {label:'High', value:sevCount.high, color:'#f87171'},
+    {label:'Medium', value:sevCount.medium, color:'#fbbf24'},
+    {label:'Low', value:sevCount.low, color:'#38bdf8'},
+    {label:'Info', value:sevCount.info, color:'#64748b'},
+  ], 'Findings');
+
+  const evCount = {payload:0, canary:0, snippet:0, none:0};
+  for (const f of S.findings) evCount[f.evidence]++;
+  donut($('#chartEvidence'), [
+    {label:'Real payload', value:evCount.payload, color:'#34d399'},
+    {label:'Canary only', value:evCount.canary, color:'#fbbf24'},
+    {label:'Reflected snippet', value:evCount.snippet, color:'#38bdf8'},
+    {label:'Unclear', value:evCount.none, color:'#64748b'},
+  ], 'Evidence');
+
+  const byParam = {};
+  for (const f of S.findings){
+    const p = f.param;
+    byParam[p] = (byParam[p]||0)+1;
+  }
+  barChart($('#chartParams'), Object.entries(byParam).map(([p,v])=>({label:p, value:v, cls: v>=5?'a':''})), {top:10});
+
+  // CSP list
+  const cspF = S.findings.filter(f=>f.csp);
+  $('#cspPanel').style.display = cspF.length ? 'block' : 'none';
+  $('#cspList').innerHTML = cspF.slice(0,30).map(f=>`
+    <div style="padding:6px 10px;border-bottom:1px solid var(--border)">
+      <span class="urlcell" style="display:inline-block;max-width:46%">${esc(f.url.split('?')[0])}</span>
+      <span class="b b-purple">?${esc(f.param)}</span>
+      <span class="hint">— ${esc(f.note||'Strict CSP')}</span>
+    </div>`).join('');
+
+  // audit summary mini
+  const aBy = {};
+  for (const a of S.audit) aBy[a.type] = (aBy[a.type]||0)+1;
+  const auditRows = Object.entries(aBy).sort((a,b)=>b[1]-a[1]);
+  $('#auditSub').textContent = S.audit.length
+    ? `${fmt(S.audit.length)} events in cleanup_audit.jsonl`
+    : 'cleanup_audit.jsonl not loaded';
+  $('#auditSummary').innerHTML = auditRows.length ? `
+    <div class="tblwrap"><table class="tbl" style="min-width:0">
+      <thead><tr><th>Event type</th><th>Count</th></tr></thead>
+      <tbody>${auditRows.map(([t,c])=>`<tr><td><span class="b b-blue">${esc(t)}</span></td><td class="num">${esc(fmt(c))}</td></tr>`).join('')}</tbody>
+    </table></div>`
+    : '<div class="empty"><span class="e-ico">🧹</span>No audit loaded</div>';
+}
+
+/* ---------------- findings tab ---------------- */
+function filteredFindings(){
+  const q = $('#fSearch').value.trim().toLowerCase();
+  const sev = $('#fSeverity').value, ev = $('#fEvidence').value;
+  const tri = $('#fTriage').value, host = $('#fHost').value;
+  const hideFp = $('#fHideFp').checked;
+  return S.findings.filter(f => {
+    const t = S.triage[f.key];
+    if (hideFp && t?.status === 'fp') return false;
+    if (sev && f.severity !== sev) return false;
+    if (ev){
+      if (ev === 'csp' && !f.csp) return false;
+      if (ev !== 'csp' && f.evidence !== ev) return false;
+    }
+    if (tri && (t?.status||'none') !== tri) return false;
+    if (host && f.host !== host) return false;
+    if (q){
+      const hay = (f.url+' '+f.param+' '+f.payloads.join(' ')+' '+f.note).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
+function renderFindings(){
+  // hosts for the filter
+  const hosts = Array.from(new Set(S.findings.map(f=>f.host))).sort();
+  const cur = $('#fHost').value;
+  $('#fHost').innerHTML = '<option value="">Host: all</option>' + hosts.map(h=>`<option ${h===cur?'selected':''}>${esc(h)}</option>`).join('');
+
+  const rows = filteredFindings();
+  const fps = S.findings.filter(f=>S.triage[f.key]?.status==='fp').length;
+  $('#findChips').innerHTML = `
+    <span class="chip">Showing: <b>${esc(fmt(Math.min(rows.length, MAX_ROWS)))}</b> of ${esc(fmt(rows.length))} filtered / ${esc(fmt(S.findings.length))} total</span>
+    <span class="chip ${fps?'err':''}">Marked false positives: <b>${esc(fmt(fps))}</b></span>
+    ${rows.length > MAX_ROWS ? `<span class="chip err">Only the first ${esc(fmt(MAX_ROWS))} rows are rendered — refine the filters to see the rest</span>` : ''}`;
+
+  const group = $('#fGroupParam').checked;
+  let items = rows.slice().sort((a,b)=> b.dupCount-a.dupCount || a.host.localeCompare(b.host) || a.path.localeCompare(b.path));
+  if (group){
+    const g = new Map();
+    for (const f of items){ if(!g.has(f.param)) g.set(f.param, []); g.get(f.param).push(f); }
+    items = Array.from(g.values()).flat();
+  }
+
+  if (!items.length){
+    $('#findRows').innerHTML = `<tr><td colspan="7"><div class="empty"><span class="e-ico">🎯</span>No findings match these filters</div></td></tr>`;
+    return;
+  }
+  const triIcon = k => { const t=S.triage[k]; return t ? `<span class="b ${t.status==='confirmed'?'b-green':t.status==='fp'?'b-red':'b-amber'}">${TRI_LABEL[t.status]||esc(t.status||'—')}</span>` : '<span class="b b-gray">—</span>'; };
+  $('#findRows').innerHTML = items.slice(0, MAX_ROWS).map((f,i)=>`
+    <tr class="clickable" data-key="${esc(f.key)}">
+      <td class="num">${esc(fmt(i+1))}</td>
+      <td><span class="b ${sevBadge(f.severity)}">${sevLabel(f.severity)}</span></td>
+      <td><div class="urlcell" title="${esc(f.url)}">${esc(f.url.split('?')[0])}</div></td>
+      <td><span class="b b-purple">?${esc(f.param)}</span>${f.extraParams?`<span class="hint"> +${esc(f.extraParams)}</span>`:''}</td>
+      <td class="hide-sm"><span class="b ${evBadge(f.evidence)}">${evLabel(f.evidence)}</span>${f.csp?' <span class="b b-purple">CSP</span>':''}</td>
+      <td class="hide-sm">${f.chunks.length? `<span class="b b-gray" title="Finding seen/confirmed in these chunks">${f.chunks.map(c=>esc(fmt(c))).join(', ')}</span> ${f.dupCount>1?`<span class="hint">×${esc(fmt(f.dupCount))}</span>`:''}` : `<span class="hint">${esc(fmt(f.dupCount))}</span>`}</td>
+      <td>${triIcon(f.key)}</td>
+    </tr>`).join('');
+}
+
+/* ---------------- modal ---------------- */
+let modalFinding = null;
+/* POSIX shell quoting: wrap in single quotes and escape embedded single quotes as '\'' */
+function shellQuote(s){
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+function openModal(key){
+  const f = S.findings.find(x=>x.key===key); if (!f) return;
+  modalFinding = f;
+  $('#mTitle').textContent = f.host + f.path + '  ?' + f.param;
+  const t = S.triage[f.key];
+  const testUrl = buildTestUrl(f);
+  const curl = `curl -gs --path-as-is ${shellQuote(testUrl.replace(/"/g,'%22'))} | head -c 4000`;
+  $('#mBody').innerHTML = `
+    <div class="mrow"><div class="k">Full URL</div><div class="v ltr">${esc(f.url)}</div></div>
+    <div class="mrow"><div class="k">Method</div><div class="v">${esc(f.method)}</div></div>
+    <div class="mrow"><div class="k">Severity (per tool)</div><div class="v"><span class="b ${sevBadge(f.severity)}">${sevLabel(f.severity)}</span> — Evidence: <span class="b ${evBadge(f.evidence)}">${evLabel(f.evidence)}</span>${f.csp?' <span class="b b-purple">CSP</span>':''}</div></div>
+    ${f.note?`<div class="mrow"><div class="k">Tool note</div><div class="v">${esc(f.note)}</div></div>`:''}
+    ${f.payloads.length?`<div class="mrow"><div class="k">Payloads (${esc(fmt(f.payloads.length))})</div><pre class="code">${esc(f.payloads.join('\n'))}</pre></div>`:''}
+    ${f.snippet?`<div class="mrow"><div class="k">Reflected snippet</div><pre class="code">${esc(f.snippet)}</pre></div>`:''}
+    <div class="mrow"><div class="k">Quick test command (curl)</div>
+      <pre class="code" id="mCurl">${esc(curl)}</pre>
+      <button class="btn small" id="mCopyCurl" style="margin-top:6px">📋 Copy curl command</button>
+    </div>
+    <div class="mrow"><div class="k">Your triage status</div>
+      <div class="triage">
+        <button class="tri-btn ${t?.status==='confirmed'?'on-green':''}" data-set="confirmed">✅ Confirmed</button>
+        <button class="tri-btn ${t?.status==='suspect'?'on-amber':''}" data-set="suspect">🤔 Suspect</button>
+        <button class="tri-btn ${t?.status==='fp'?'on-red':''}" data-set="fp">❌ False positive</button>
+        <button class="tri-btn" data-set="">Clear</button>
+      </div>
+      <input id="mNote" placeholder="Personal note (optional)..." style="margin-top:10px" value="${esc(t?.note||'')}">
+    </div>
+    <details class="raw"><summary>Raw JSON of this finding</summary><pre class="code" style="margin-top:8px">${esc(JSON.stringify(f.raw, null, 2))}</pre></details>`;
+  $('#modal').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+function buildTestUrl(f){
+  try {
+    const u = new URL(f.url);
+    u.searchParams.set(f.param, "<svg onload=alert(1)>");
+    return u.toString();
+  } catch(e){
+    // relative or malformed URL — fall back to the raw value so the modal still works
+    return f.url;
+  }
+}
+function closeModal(){ $('#modal').classList.remove('open'); document.body.style.overflow=''; modalFinding=null; }
+
+/* ---------------- params tab ---------------- */
+function renderParams(){
+  const byParam = new Map();
+  for (const f of S.findings){
+    if (!byParam.has(f.param)) byParam.set(f.param, {count:0, urls:new Set(), hosts:new Set(), sample:f.url, fpHit:0});
+    const e = byParam.get(f.param);
+    e.count++; e.urls.add(f.path); e.hosts.add(f.host);
+    if (FP_PARAM_RE.test(f.param) || JSONP_RE.test(f.param)) e.fpHit = 1;
+  }
+  const q = $('#pSearch').value.trim().toLowerCase();
+  let arr = Array.from(byParam.entries());
+  if (q) arr = arr.filter(([p])=>p.toLowerCase().includes(q));
+  arr.sort((a,b)=>b[1].count-a[1].count);
+  $('#paramsMeta').textContent = `${fmt(arr.length)} unique parameters from ${fmt(S.findings.length)} findings` + (arr.length > PARAM_ROWS ? ` — showing the first ${PARAM_ROWS}` : '');
+  $('#paramKpis').innerHTML = [
+    {l:'Unique parameters', v:fmt(byParam.size), c:''},
+    {l:'Suspected-FP parameters', v:fmt(Array.from(byParam.values()).filter(e=>e.fpHit).length), c:'a', d:'Known non-vulnerability pattern'},
+    {l:'Ever-present parameters', v:fmt(Array.from(byParam.values()).filter(e=>e.count>=5).length), c:'p', d:'≥5 paths — likely shared app behavior'},
+  ].map(k=>`<div class="kpi ${k.c}"><div class="lbl">${esc(k.l)}</div><div class="v">${esc(k.v)}</div><div class="d">${esc(k.d||'')}</div></div>`).join('');
+
+  $('#paramRows').innerHTML = arr.length ? arr.slice(0,PARAM_ROWS).map(([p,e])=>{
+    const fpBadge = e.fpHit ? '<span class="b b-amber" title="Noisy/analytics/JSONP-style parameter pattern">Likely FP</span>' : '<span class="b b-gray">—</span>';
+    return `<tr>
+      <td><span class="b b-purple">?${esc(p)}</span></td>
+      <td class="num">${esc(fmt(e.count))}</td>
+      <td class="hide-sm"><div class="urlcell" title="${esc(e.sample)}">${esc(e.sample.split('?')[0])}</div></td>
+      <td>${fpBadge}</td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="4"><div class="empty">No parameters</div></td></tr>`;
+
+  // hosts capped per the audit
+  const capped = S.audit.filter(a=>/max params|capped|limit/i.test(a.type + ' ' + a.detail));
+  $('#cappedPanel').style.display = capped.length ? 'block' : 'none';
+  $('#cappedList').innerHTML = capped.slice(0,40).map(a=>`
+    <div style="padding:6px 10px;border-bottom:1px solid var(--border)">
+      <span class="b b-amber">${esc(a.type)}</span> <span class="ltr">${esc(a.target||'')}</span>
+      <span class="hint"> ${esc(a.detail)}</span></div>`).join('');
+}
+
+/* ---------------- audit tab ---------------- */
+function renderAudit(){
+  const types = Array.from(new Set(S.audit.map(a=>a.type))).sort();
+  const curT = $('#aType').value;
+  $('#aType').innerHTML = '<option value="">Event type: all</option>' + types.map(t=>`<option ${t===curT?'selected':''}>${esc(t)}</option>`).join('');
+  const q = $('#aSearch').value.trim().toLowerCase();
+  let rows = S.audit.filter(a => (!curT || a.type===curT) && (!q || (a.target+' '+a.detail+' '+a.rawLine).toLowerCase().includes(q)));
+  $('#auditMeta').textContent = `${fmt(rows.length)} of ${fmt(S.audit.length)} events` + (rows.length > AUDIT_ROWS ? ` — showing the first ${AUDIT_ROWS}` : '');
+  $('#auditRows').innerHTML = rows.length ? rows.slice(0,AUDIT_ROWS).map(a=>`
+    <tr>
+      <td class="ltr" style="font-size:.72rem;color:var(--muted)">${esc(a.ts||'—')}</td>
+      <td><span class="b b-blue">${esc(a.type)}</span></td>
+      <td class="hide-sm"><span class="ltr" style="font-size:.75rem">${esc(a.target||'—')}</span></td>
+      <td style="font-size:.78rem;color:var(--muted)">${esc(a.detail||a.rawLine)}</td>
+    </tr>`).join('') : `<tr><td colspan="4"><div class="empty">No events match these filters</div></td></tr>`;
+}
+
+/* ---------------- report tab ---------------- */
+function renderReport(){
+  const has = !!S.reportMd;
+  $('#reportEmpty').style.display = has ? 'none' : 'block';
+  $('#mdRender').innerHTML = has ? mdToHtml(S.reportMd) : '';
+  $('#mdRender').parentElement.style.display = has ? 'block' : 'none';
+  $('#mdRawView').parentElement.style.display = (has && $('#mdRaw').checked) ? 'block' : 'none';
+  if (has) $('#mdRawView').textContent = S.reportMd;
+}
+
+/* ---------------- log tab ---------------- */
+function parseAndRenderLog(){
+  if (!S.logText) { $('#logSummaryPanel').style.display='none'; $('#logVulns').innerHTML='<div class="empty"><span class="e-ico">📜</span>No log loaded</div>'; return; }
+  const {stats, uniqueVulns} = parseLog(S.logText);
+  const dur = (stats.firstTs && stats.lastTs) ? tsDiff(stats.firstTs, stats.lastTs) : null;
+  $('#logSummaryPanel').style.display = 'block';
+  $('#logSummary').innerHTML = `
+    <div class="tblwrap"><table class="tbl" style="min-width:0">
+      <tbody>
+        <tr><td>Log window</td><td class="num">${esc(stats.firstTs||'—')} to ${esc(stats.lastTs||'—')}${dur?` (${esc(dur)})`:''}</td></tr>
+        <tr><td>xssniper invocations</td><td class="num">${esc(fmt(stats.tests))} (fresh probes: ${esc(fmt(stats.fresh))} / reused: ${esc(fmt(stats.reuse))})</td></tr>
+        <tr><td>Tested paths/hosts</td><td class="num">${esc(fmt(stats.targets.size))}</td></tr>
+        <tr><td>URLs probed → reflections</td><td class="num">${esc(fmt(stats.probedUrls))} → ${esc(fmt(stats.reflections))}</td></tr>
+        <tr><td>VULN FOUND blocks</td><td class="num">${esc(fmt(stats.vulnBlocks))} → ${esc(fmt(uniqueVulns.length))} unique findings</td></tr>
+        <tr><td>curl_reflect_checker 5-minute timeouts</td><td class="num" style="color:${stats.timeouts?'var(--red)':'inherit'}">${esc(fmt(stats.timeouts))}</td></tr>
+      </tbody>
+    </table></div>
+    ${stats.collapseLines.length?`<details class="raw" open><summary>Dedup/collapse lines</summary><pre class="code" style="margin-top:6px">${esc(stats.collapseLines.join('\n'))}</pre></details>`:''}
+    ${stats.maxPathsLines.length?`<details class="raw" open><summary>MAX-PATHS lines</summary><pre class="code" style="margin-top:6px">${esc(stats.maxPathsLines.join('\n'))}</pre></details>`:''}`;
+  const shownVulns = uniqueVulns.slice(0, MAX_ROWS);
+  $('#logVulns').innerHTML = shownVulns.length ? shownVulns.map(v=>`
+    <div style="padding:8px 12px;border:1px solid var(--border);border-radius:10px;margin-bottom:8px;background:var(--panel2)">
+      <div class="urlcell" style="max-width:100%;margin-bottom:4px">${esc(v.url)}</div>
+      <div><span class="b b-purple">?${esc(v.param)}</span>
+        <span class="b ${v.confidence.includes('like')?'b-amber':'b-green'}">${esc(v.confidence)}</span>
+        ${v.count>1?`<span class="b b-gray">Confirmed in ${esc(fmt(v.count))} chunks</span>`:''}
+        ${/csp/i.test(v.note)?'<span class="b b-purple">CSP</span>':''}</div>
+      ${v.payloads?`<div class="hint" style="margin-top:4px;font-family:var(--mono);font-size:.7rem;word-break:break-all">${esc(v.payloads)}</div>`:''}
+      ${v.note?`<div class="hint" style="margin-top:2px">📝 ${esc(v.note)}</div>`:''}
+    </div>`).join('') + (uniqueVulns.length > MAX_ROWS
+      ? `<div class="hint" style="padding:8px 12px">Showing the first ${esc(fmt(MAX_ROWS))} of ${esc(fmt(uniqueVulns.length))} blocks — the rest are still included when you add them to the Findings tab.</div>`
+      : '') : '<div class="empty"><span class="e-ico">🎯</span>No blocks found</div>';
+  S._logParsed = {stats, uniqueVulns};
+}
+function tsDiff(a, b){
+  const p = s => s.split(':').map(Number);
+  let [h1,m1,s1]=p(a), [h2,m2,s2]=p(b);
+  let d = (h2*3600+m2*60+s2)-(h1*3600+m1*60+s1);
+  if (d < 0) d += 86400;
+  const h=Math.floor(d/3600), m=Math.floor(d%3600/60), s=d%60;
+  return (h?h+'h ':'') + (m?m+'m ':'') + s + 's';
+}
+
+/* ---------------- export / import triage ---------------- */
+function downloadFile(name, content, type){
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([content], {type: type||'text/plain;charset=utf-8'}));
+  a.download = name; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 3000);
+}
+function exportCsv(){
+  const rows = filteredFindings();
+  const q = v => '"' + String(v??'').replace(/"/g,'""') + '"';
+  const head = ['url','method','param','severity','evidence','csp','triage','note_tool','payloads','dup_count','chunks'];
+  const lines = [head.join(',')];
+  for (const f of rows){
+    lines.push([f.url, f.method, f.param, f.severity, f.evidence, f.csp?1:0, S.triage[f.key]?.status||'', f.note, f.payloads.join(' | '), f.dupCount, f.chunks.join('/')].map(q).join(','));
+  }
+  downloadFile('xsscanner-findings.csv', '\ufeff' + lines.join('\n'), 'text/csv;charset=utf-8');
+  toast('CSV downloaded — '+fmt(rows.length)+' rows');
+}
+function exportJson(){
+  const rows = filteredFindings().map(f => ({...f, raw:undefined, triage: S.triage[f.key]||null}));
+  downloadFile('xsscanner-findings.json', JSON.stringify({exportedAt:new Date().toISOString(), count:rows.length, findings:rows}, null, 2), 'application/json');
+  toast('JSON downloaded — '+fmt(rows.length)+' rows');
+}
+function importTriageFile(file){
+  const r = new FileReader();
+  r.onload = () => {
+    try {
+      const d = JSON.parse(r.result);
+      const map = d.triage || d;
+      let n = 0;
+      for (const [k,v] of Object.entries(map)){ if (v && v.status){ S.triage[k] = {status:v.status, note:v.note||'', ts:v.ts||Date.now()}; n++; } }
+      saveTriage(); renderAll(); toast('✅ '+fmt(n)+' triage decisions imported');
+    } catch(e){ toast('⚠️ Invalid import file format', 4000); }
+  };
+  r.readAsText(file);
+}
+
+
+/* ======== EVENTS ======== */
+'use strict';
+/* ============================================================
+   XSScanner Results Viewer — events & wiring
+   ============================================================ */
+
+/* ---------------- tabs ---------------- */
+$('#tabs').addEventListener('click', e => {
+  const b = e.target.closest('.tab'); if (!b) return;
+  $$('.tab').forEach(t=>t.classList.toggle('active', t===b));
+  $$('.tabpane').forEach(p=>p.classList.toggle('active', p.id === 'pane-'+b.dataset.tab));
+});
+
+/* ---------------- toolbar: loading ---------------- */
+$('#btnLoadAuto').addEventListener('click', autoLoad);
+$('#btnPickFindings').addEventListener('click', ()=>$('#fileFindings').click());
+$('#btnPickAudit').addEventListener('click', ()=>$('#fileAudit').click());
+$('#btnPickReport').addEventListener('click', ()=>$('#fileReport').click());
+$('#fileFindings').addEventListener('change', e => readInputs(e.target.files, 'findings'));
+$('#fileAudit').addEventListener('change', e => readInputs(e.target.files, 'audit'));
+$('#fileReport').addEventListener('change', e => readInputs(e.target.files, 'report'));
+$('#fileLog').addEventListener('change', e => readInputs(e.target.files, 'log'));
+
+function readFilesAndRoute(files){
+  let n = 0;
+  for (const f of files){
+    n++;
+    const r = new FileReader();
+    r.onload = () => {
+      const kind = guessKind(f.name, r.result);
+      routeLoaded(kind, r.result, f.name);
+      toast('📂 '+f.name+' → '+({findings:'Findings', audit:'Audit', report:'Report', log:'Log'})[kind]);
+    };
+    r.readAsText(f);
+  }
+  return n;
+}
+function readInputs(fileList, forcedKind){
+  for (const f of fileList){
+    const r = new FileReader();
+    r.onload = () => {
+      const kind = forcedKind || guessKind(f.name, r.result);
+      routeLoaded(kind, r.result, f.name);
+      toast('📂 '+f.name+' loaded');
+    };
+    r.readAsText(f);
+  }
+}
+
+/* ---------------- drag & drop on the whole page ---------------- */
+let dragDepth = 0;
+window.addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; document.body.classList.add('dragging'); });
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('dragleave', e => { e.preventDefault(); if(--dragDepth<=0){ dragDepth=0; document.body.classList.remove('dragging'); } });
+window.addEventListener('drop', e => {
+  e.preventDefault(); dragDepth=0; document.body.classList.remove('dragging');
+  if (e.dataTransfer.files?.length) readFilesAndRoute(e.dataTransfer.files);
+  else {
+    const txt = e.dataTransfer.getData('text');
+    if (txt && txt.length > 20){ routeLoaded(guessKind('', txt), txt, 'dropped-text'); toast('📄 Dropped text loaded'); }
+  }
+});
+
+/* ---------------- reset ---------------- */
+$('#btnReset').addEventListener('click', () => {
+  if (!confirm('Clear all loaded data? (Triage decisions stay in localStorage)')) return;
+  S.findings=[]; S.rawCount=0; S.dupDropped=0; S.audit=[]; S.reportMd=null; S.logText=null;
+  $('#loadStatus').innerHTML=''; renderAll(); toast('🧹 Cleared');
+});
+
+/* ---------------- findings filters (debounced) ---------------- */
+const debouncedFindings = debounce(renderFindings, 150);
+['fSearch','fSeverity','fEvidence','fTriage','fHost'].forEach(id => $('#'+id).addEventListener('input', debouncedFindings));
+$('#fHideFp').addEventListener('change', debouncedFindings);
+$('#fGroupParam').addEventListener('change', debouncedFindings);
+
+/* row click → modal */
+$('#findRows').addEventListener('click', e => {
+  const tr = e.target.closest('tr[data-key]'); if (!tr) return;
+  openModal(tr.dataset.key);
+});
+
+/* ---------------- modal events ---------------- */
+$('#mClose').addEventListener('click', closeModal);
+$('#modal').addEventListener('click', e => { if (e.target.id==='modal') closeModal(); });
+document.addEventListener('keydown', e => { if (e.key==='Escape') closeModal(); });
+$('#mCopyJson').addEventListener('click', () => {
+  if (!modalFinding) return;
+  const txt = JSON.stringify(modalFinding.raw, null, 2);
+  copyText(txt).then(ok => copyToast(ok, 'JSON'));
+});
+$('#mBody').addEventListener('click', e => {
+  if (e.target.closest('#mCopyCurl')){
+    copyText($('#mCurl')?.textContent || '').then(ok => copyToast(ok, 'curl command'));
+    return;
+  }
+  const b = e.target.closest('.tri-btn'); if (!b || !modalFinding) return;
+  const set = b.dataset.set;
+  if (set) S.triage[modalFinding.key] = {status:set, note: ($('#mNote')?.value)||'', ts:Date.now()};
+  else delete S.triage[modalFinding.key];
+  saveTriage();
+  $$('#mBody .tri-btn').forEach(x=>x.classList.remove('on-green','on-amber','on-red'));
+  if (set) b.classList.add({confirmed:'on-green', suspect:'on-amber', fp:'on-red'}[set]);
+  renderFindings(); renderSummary();
+  toast(set ? 'Saved: '+(TRI_LABEL[set]||set) : 'Triage cleared');
+});
+$('#mBody').addEventListener('change', e => {
+  if (e.target.id==='mNote' && modalFinding){
+    const t = S.triage[modalFinding.key];
+    if (t){ t.note = e.target.value; saveTriage(); }
+  }
+});
+
+/* ---------------- export / import ---------------- */
+$('#btnExportCsv').addEventListener('click', exportCsv);
+$('#btnExportJson').addEventListener('click', () => {
+  // include triage decisions so they can be restored
+  const rows = filteredFindings().map(f => ({...f, raw:undefined, triage: S.triage[f.key]||null}));
+  downloadFile('xsscanner-findings.json', JSON.stringify({exportedAt:new Date().toISOString(), count:rows.length, triage:S.triage, findings:rows}, null, 2), 'application/json');
+  toast('JSON downloaded — '+fmt(rows.length)+' rows');
+});
+$('#btnImportTriage').addEventListener('click', ()=>$('#fileTriage').click());
+$('#fileTriage').addEventListener('change', e => { if (e.target.files[0]) importTriageFile(e.target.files[0]); e.target.value=''; });
+
+/* ---------------- params / audit filters (debounced) ---------------- */
+$('#pSearch').addEventListener('input', debounce(renderParams, 150));
+$('#aType').addEventListener('change', debounce(renderAudit, 150));
+$('#aSearch').addEventListener('input', debounce(renderAudit, 150));
+
+/* ---------------- log tab ---------------- */
+$('#btnPickLog').addEventListener('click', ()=>$('#fileLog').click());
+$('#btnParsePaste').addEventListener('click', ()=>parseFromPaste());
+$('#btnParsePaste2').addEventListener('click', ()=>parseFromPaste());
+function parseFromPaste(){
+  const t = $('#logPaste').value;
+  if (!t.trim()){ toast('Nothing to analyze'); return; }
+  S.logText = t;
+  parseAndRenderLog();
+  statusChip('log', 'pasted log: '+fmt(t.split('\n').length)+' lines', 'ok');
+  toast('🧮 Log analyzed');
+}
+$('#btnImportLogVulns').addEventListener('click', () => {
+  if (!S._logParsed){ toast('Analyze a log first'); return; }
+  const list = S._logParsed.uniqueVulns.map(v => ({
+    url: v.url, param: v.param, note: v.note,
+    payloads: v.payloads ? v.payloads.split(/\s*,\s*/) : [],
+  }));
+  const {added, merged} = addFindings(list, 'log');
+  renderAll();
+  toast(`➕ ${fmt(added)} findings added from log${merged?` (${fmt(merged)} merged)`:''}`);
+});
+$('#btnClearLog').addEventListener('click', () => {
+  S.logText = null; S._logParsed = null;
+  $('#logPaste').value = '';
+  parseAndRenderLog();
+  const c = $('#loadStatus [data-k="log"]'); if (c) c.remove();
+  toast('Log cleared');
+});
+
+/* ---------------- report tab ---------------- */
+$('#btnReloadReport').addEventListener('click', async () => {
+  const r = await tryFetch('TARGET_REPORT.md');
+  if (r){ S.reportMd = r.text; statusChip('report','TARGET_REPORT reloaded','ok'); renderReport(); toast('✅ Report reloaded'); }
+  else toast('⚠️ TARGET_REPORT.md not available', 4000);
+});
+$('#mdRaw').addEventListener('change', renderReport);
+
+/* ---------------- init ---------------- */
+loadTriage();
+renderAll();
+// if served over http, try auto-loading (file:// cannot fetch)
+if (location.protocol !== 'file:') autoLoad();
+
+</script>
+</body>
+</html>
